@@ -91,9 +91,28 @@ swarm_orchestrate {
 | Command | Purpose |
 |---------|---------|
 | `/swarm` | Live dashboard of tasks and jobs. |
+| `/swarm-config` | Interactive menu to pick which model each agent type uses. |
 | `/swarm-cancel <taskId\|jobId\|all>` | Cancel work. |
-| `/swarm-agents` | List available agent profiles. |
+| `/swarm-agents` | List available agent profiles and their effective models. |
 | `/swarm-clear` | Drop finished tasks/jobs from the registry. |
+
+### Choosing models per agent
+
+Run `/swarm-config` to open an interactive settings panel (a `SettingsList`) with
+one row per agent type (plus the default for profile-less tasks) and general
+settings (max concurrency, agent scope, status widget, notify-on-complete).
+Selecting a model row opens a **searchable, paginated** picker over the models you
+have credentials for plus your `enabledModels` from `settings.json`; an "inherit"
+row clears the override. Changes save to `~/.pi/agent/swarm/config.json`
+(`agentModels`) and take effect immediately.
+
+Model precedence for a sub-agent (first that is set wins):
+
+1. explicit `model` passed to the tool call,
+2. `/swarm-config` per-agent override (`agentModels[<agent>]`),
+3. the profile's own `model` frontmatter,
+4. `defaultModel`,
+5. otherwise it inherits your active model.
 
 ## Agent profiles
 
@@ -115,6 +134,7 @@ for trusted projects, `<project>/.pi/swarm.json`:
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `defaultModel` | `""` | Model for sub-agents; empty inherits your default. |
+| `agentModels` | `{}` | Per-agent model overrides (managed by `/swarm-config`). |
 | `maxConcurrency` | `4` | Max sub-agent processes running at once. |
 | `maxSpawnBatch` | `16` | Max tasks per `swarm_spawn` call. |
 | `defaultAgentScope` | `"user"` | Agent-profile scope. |

@@ -251,43 +251,65 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 		}),
 		async execute(_id, params, signal) {
 			const timing = withTimeout(signal, params.timeoutMs);
+			const cap = rt.config.perTaskOutputCap;
 			try {
-				let taskIds: string[];
-				let group: GroupRecord | undefined;
+				// Case 1: await a specific job (workflow / orchestration).
 				if (params.group) {
-					group = rt.groups.get(params.group);
+					let group = rt.groups.get(params.group);
 					if (!group) throw new Error(`Unknown job id: ${params.group}`);
 					await rt.groups.waitFor([group.id], timing.signal);
-					group = rt.groups.get(params.group);
-					taskIds = group?.taskIds ?? [];
-				} else {
-					taskIds = params.ids ?? rt.runner.list().filter((t) => t.status === "queued" || t.status === "running").map((t) => t.id);
-					if (taskIds.length === 0 && rt.groups.activeCount() === 0) {
-						return { content: [{ type: "text", text: "Nothing to await: no active swarm work." }], details: { taskIds: [] } };
-					}
-					await rt.runner.waitFor(taskIds, timing.signal);
-				}
-
-				const tasks = taskIds.map((id) => rt.runner.get(id)).filter((t): t is TaskRecord => Boolean(t));
-				const stillRunning = tasks.filter((t) => t.status === "queued" || t.status === "running");
-				const cap = rt.config.perTaskOutputCap;
-
-				if (group) {
-					const gStatus = rt.groups.get(group.id);
+					group = rt.groups.get(params.group) ?? group;
 					const header = timing.timedOut()
-						? `Timed out after ${params.timeoutMs}ms. Job ${group.id} status: ${gStatus?.status}.`
-						: `Job ${group.id} [${gStatus?.status}].`;
+						? `Timed out after ${params.timeoutMs}ms. Job ${group.id} status: ${group.status}.`
+						: `Job ${group.id} [${group.status}].`;
+					const err = group.errorMessage ? `\n${group.errorMessage}` : "";
 					return {
-						content: [{ type: "text", text: `${header}\n\n${capBytes(gStatus?.output || "(no output yet)", cap * 4)}` }],
-						details: { taskIds, groupIds: [group.id] },
+						content: [{ type: "text", text: `${header}${err}\n\n${capBytes(group.output || "(no output yet)", cap * 4)}` }],
+						details: { taskIds: group.taskIds, groupIds: [group.id] },
 					};
 				}
 
-				const blocks = tasks.map((t) => taskOutputBlock(t, cap)).join("\n\n---\n\n");
-				const header = timing.timedOut()
-					? `Timed out after ${params.timeoutMs}ms. ${stillRunning.length} still running.`
-					: `${tasks.filter((t) => t.status === "succeeded").length}/${tasks.length} succeeded.`;
-				return { content: [{ type: "text", text: `${header}\n\n${blocks}` }], details: { taskIds } };
+				// Case 2: await a specific set of tasks.
+				if (params.ids && params.ids.length > 0) {
+					await rt.runner.waitFor(params.ids, timing.signal);
+					const tasks = params.ids.map((id) => rt.runner.get(id)).filter((t): t is TaskRecord => Boolean(t));
+					const stillRunning = tasks.filter((t) => t.status === "queued" || t.status === "running").length;
+					const blocks = tasks.map((t) => taskOutputBlock(t, cap)).join("\n\n---\n\n");
+					const header = timing.timedOut()
+						? `Timed out after ${params.timeoutMs}ms. ${stillRunning} still running.`
+						: `${tasks.filter((t) => t.status === "succeeded").length}/${tasks.length} succeeded.`;
+					return { content: [{ type: "text", text: `${header}\n\n${blocks}` }], details: { taskIds: params.ids } };
+				}
+
+				// Case 3: await ALL currently-active work - loose tasks AND jobs.
+				// Jobs enqueue later-stage tasks lazily, so we must await the group
+				// itself, not just the tasks that happen to be running right now.
+				const activeTaskIds = rt.runner.list().filter((t) => t.status === "queued" || t.status === "running").map((t) => t.id);
+				const activeGroupIds = rt.groups.list().filter((g) => g.status === "running").map((g) => g.id);
+				if (activeTaskIds.length === 0 && activeGroupIds.length === 0) {
+					return { content: [{ type: "text", text: "Nothing to await: no active swarm work." }], details: { taskIds: [] } };
+				}
+				await Promise.all([
+					rt.runner.waitFor(activeTaskIds, timing.signal),
+					activeGroupIds.length > 0 ? rt.groups.waitFor(activeGroupIds, timing.signal) : Promise.resolve([]),
+				]);
+
+				const groups = activeGroupIds.map((id) => rt.groups.get(id)).filter((g): g is GroupRecord => Boolean(g));
+				const tasks = activeTaskIds.map((id) => rt.runner.get(id)).filter((t): t is TaskRecord => Boolean(t));
+				const parts: string[] = [];
+				if (timing.timedOut()) {
+					const running = tasks.filter((t) => t.status === "queued" || t.status === "running").length + groups.filter((g) => g.status === "running").length;
+					parts.push(`Timed out after ${params.timeoutMs}ms. ${running} item(s) still running.`);
+				}
+				for (const g of groups) {
+					const err = g.errorMessage ? ` - ${g.errorMessage}` : "";
+					parts.push(`## Job ${g.id} [${g.status}] ${g.kind}${err}\n\n${capBytes(g.output || "(no output yet)", cap * 2)}`);
+				}
+				for (const t of tasks) parts.push(taskOutputBlock(t, cap));
+				return {
+					content: [{ type: "text", text: parts.join("\n\n---\n\n") || "All active swarm work finished." }],
+					details: { taskIds: activeTaskIds, groupIds: activeGroupIds },
+				};
 			} finally {
 				timing.cleanup();
 			}

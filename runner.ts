@@ -75,6 +75,11 @@ export class SwarmRunner {
 	adopt(records: TaskRecord[]): void {
 		for (const record of records) {
 			if (this.records.has(record.id)) continue;
+			// Backfill fields that older or hand-edited snapshots may lack, so the
+			// status/render paths never dereference an undefined usage/toolCalls.
+			record.usage = record.usage ?? emptyUsage();
+			if (!Array.isArray(record.toolCalls)) record.toolCalls = [];
+			if (typeof record.output !== "string") record.output = "";
 			// A task that a previous process left mid-flight can no longer be
 			// supervised: its child died with that process. Mark it detached.
 			if (record.status === "running" || record.status === "queued") {
@@ -111,7 +116,10 @@ export class SwarmRunner {
 		const scope: AgentScope = spec.agentScope ?? this.deps.config.defaultAgentScope;
 		const profile = spec.agent ? this.deps.resolveProfile(spec.agent, scope) : undefined;
 
-		const model = spec.model ?? profile?.model ?? (this.deps.config.defaultModel || undefined);
+		// Model precedence: explicit call arg > /swarm-config per-agent override >
+		// profile frontmatter > config default > inherit the user's active model.
+		const configModel = spec.agent ? this.deps.config.agentModels?.[spec.agent] : undefined;
+		const model = spec.model ?? (configModel || undefined) ?? profile?.model ?? (this.deps.config.defaultModel || undefined);
 		const tools = spec.tools ?? profile?.tools;
 
 		const record: TaskRecord = {
@@ -150,6 +158,7 @@ export class SwarmRunner {
 			this.persist(record);
 			resolve(record);
 			this.deps.onChange();
+			this.deps.onTaskComplete?.(record);
 			return record;
 		}
 
@@ -226,7 +235,7 @@ export class SwarmRunner {
 	private killProc(proc: ChildProcess): void {
 		try {
 			proc.kill("SIGTERM");
-			setTimeout(() => {
+			const timer = setTimeout(() => {
 				if (!proc.killed) {
 					try {
 						proc.kill("SIGKILL");
@@ -235,6 +244,8 @@ export class SwarmRunner {
 					}
 				}
 			}, 5000);
+			// Don't let the escalation timer keep the pi process alive at exit.
+			timer.unref?.();
 		} catch {
 			// ignore
 		}
@@ -325,7 +336,10 @@ export class SwarmRunner {
 			} catch {
 				return;
 			}
-			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+			// `--mode json` emits message_end for user, assistant, AND toolResult
+			// messages; that single event type covers everything we derive output
+			// and tool-call display from.
+			if (event.type === "message_end" && event.message) {
 				handle.messages.push(event.message);
 				this.applyMessage(record, handle, event.message);
 				this.persist(record);
@@ -454,13 +468,9 @@ export class SwarmRunner {
 	/** Kill everything still running (used on session shutdown). */
 	shutdown(): void {
 		for (const handle of this.handles.values()) {
-			if (handle.proc && !handle.proc.killed) {
-				try {
-					handle.proc.kill("SIGTERM");
-				} catch {
-					// ignore
-				}
-			}
+			// Use the same SIGTERM -> SIGKILL escalation as cancel so a child that
+			// ignores SIGTERM is not orphaned past session/reload teardown (POSIX).
+			if (handle.proc && !handle.proc.killed) this.killProc(handle.proc);
 			this.cleanupTemp(handle);
 		}
 	}

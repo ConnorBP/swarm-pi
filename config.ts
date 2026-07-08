@@ -15,6 +15,7 @@ import type { SwarmConfig } from "./types.ts";
 
 export const DEFAULT_CONFIG: SwarmConfig = {
 	defaultModel: "",
+	agentModels: {},
 	maxConcurrency: 4,
 	maxSpawnBatch: 16,
 	defaultAgentScope: "user",
@@ -42,15 +43,27 @@ function readJsonIfExists(file: string): Record<string, unknown> | undefined {
 	return undefined;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function mergeConfig(base: SwarmConfig, override: Record<string, unknown> | undefined): SwarmConfig {
 	if (!override) return base;
 	const next: SwarmConfig = { ...base };
 	for (const key of Object.keys(base) as Array<keyof SwarmConfig>) {
 		if (override[key] === undefined) continue;
 		const value = override[key];
-		// Only accept a value with the same primitive/array kind as the default.
 		if (Array.isArray(base[key])) {
 			if (Array.isArray(value)) (next[key] as unknown) = value;
+		} else if (isPlainObject(base[key])) {
+			// Nested maps (e.g. agentModels) merge key-by-key, coercing string values.
+			if (isPlainObject(value)) {
+				const merged: Record<string, string> = { ...(base[key] as Record<string, string>) };
+				for (const [k, v] of Object.entries(value)) {
+					if (typeof v === "string") merged[k] = v;
+				}
+				(next[key] as unknown) = merged;
+			}
 		} else if (typeof base[key] === typeof value) {
 			(next[key] as unknown) = value;
 		}
@@ -76,7 +89,30 @@ export function loadConfig(options: LoadConfigOptions): SwarmConfig {
 	config.maxConcurrency = clampInt(config.maxConcurrency, 1, 32, DEFAULT_CONFIG.maxConcurrency);
 	config.maxSpawnBatch = clampInt(config.maxSpawnBatch, 1, 64, DEFAULT_CONFIG.maxSpawnBatch);
 	config.perTaskOutputCap = clampInt(config.perTaskOutputCap, 1024, 512 * 1024, DEFAULT_CONFIG.perTaskOutputCap);
+	if (!["user", "project", "both"].includes(config.defaultAgentScope)) {
+		config.defaultAgentScope = DEFAULT_CONFIG.defaultAgentScope;
+	}
+	// Ensure agentModels is an owned object (not shared with DEFAULT_CONFIG) so
+	// in-memory edits from /swarm-config never mutate the module default.
+	config.agentModels = isPlainObject(config.agentModels) ? { ...config.agentModels } : {};
 	return config;
+}
+
+/**
+ * Persist a partial config to the user-level file (~/.pi/agent/swarm/config.json),
+ * merging with whatever is already there. Used by the /swarm-config settings menu.
+ */
+export function saveUserConfig(patch: Record<string, unknown>): void {
+	const dir = swarmStateRoot();
+	const file = path.join(dir, "config.json");
+	try {
+		fs.mkdirSync(dir, { recursive: true });
+		const existing = readJsonIfExists(file) ?? {};
+		const merged = { ...existing, ...patch };
+		fs.writeFileSync(file, `${JSON.stringify(merged, null, 2)}\n`, "utf-8");
+	} catch {
+		// best effort; surfaced to the user by the caller if needed
+	}
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {

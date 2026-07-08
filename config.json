@@ -1,5 +1,6 @@
 {
 	"defaultModel": "",
+	"agentModels": {},
 	"maxConcurrency": 4,
 	"maxSpawnBatch": 16,
 	"defaultAgentScope": "user",

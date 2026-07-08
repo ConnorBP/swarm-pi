@@ -23,6 +23,8 @@ export class GroupRegistry {
 	adopt(records: GroupRecord[]): void {
 		for (const record of records) {
 			if (this.records.has(record.id)) continue;
+			if (!Array.isArray(record.taskIds)) record.taskIds = [];
+			if (typeof record.output !== "string") record.output = "";
 			if (record.status === "running") {
 				record.status = "failed";
 				record.errorMessage = record.errorMessage ?? "Interrupted: process exited before completion.";

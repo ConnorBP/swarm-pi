@@ -148,6 +148,11 @@ export interface PlannedChunk {
 export interface SwarmConfig {
 	/** Model for sub-agents when a profile / call does not specify one. Empty = inherit user default. */
 	defaultModel: string;
+	/**
+	 * Per-agent-profile model overrides, e.g. { planner: "provider/id", worker: "provider/id" }.
+	 * Takes precedence over the profile's own `model` frontmatter. Managed via /swarm-config.
+	 */
+	agentModels: Record<string, string>;
 	/** Max sub-agent subprocesses running at once (global). */
 	maxConcurrency: number;
 	/** Max tasks accepted in a single swarm_spawn call. */

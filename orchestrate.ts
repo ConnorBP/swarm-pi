@@ -13,7 +13,7 @@
  * spawns it, keeps working, then awaits or polls it.
  */
 
-import type { GroupRecord, OrchestrateSpec, PlannedChunk, TaskRecord } from "./types.ts";
+import type { GroupRecord, GroupStatus, OrchestrateSpec, PlannedChunk, TaskRecord } from "./types.ts";
 import { capBytes, extractJson, mapWithConcurrency } from "./util.ts";
 import type { CoordinatorDeps } from "./workflow.ts";
 
@@ -152,7 +152,28 @@ async function runOrchestration(deps: CoordinatorDeps, spec: OrchestrateSpec, gr
 		}
 	}
 
-	// 4. Synthesize (optional) -------------------------------------------------
+	// 4. Re-evaluate outcome after validation/retries, then synthesize --------
+	// Validation retries can move chunks from succeeded back to failed, so the
+	// pre-validation all-failed guard is not enough on its own.
+	if (succeeded.size === 0) {
+		deps.groups.finish(
+			group.id,
+			"failed",
+			renderChunkReport(chunks, results, blocked, cap),
+			"All chunks failed (including validation retries).",
+		);
+		return;
+	}
+
+	const failedIds = chunks.filter((c) => failed.has(c.id)).map((c) => c.id);
+	const incomplete = failedIds.length > 0 || blocked.length > 0;
+	const finalStatus: GroupStatus = incomplete ? "failed" : "succeeded";
+	const finalNote = incomplete
+		? `Incomplete: ${succeeded.size} succeeded` +
+			`${failedIds.length ? `, ${failedIds.length} failed [${failedIds.join(", ")}]` : ""}` +
+			`${blocked.length ? `, ${blocked.length} blocked [${blocked.join(", ")}]` : ""}.`
+		: undefined;
+
 	const report = renderChunkReport(chunks, results, blocked, cap);
 	if (spec.synthesize !== false) {
 		group.note = "synthesizing";
@@ -161,12 +182,12 @@ async function runOrchestration(deps: CoordinatorDeps, spec: OrchestrateSpec, gr
 		const synth = await enqueueAndWait(prompt, spec.synthesizerAgent ?? "synthesizer", "synthesizer", { role: "synthesizer" });
 		if (synth.status === "succeeded" && synth.output.trim()) {
 			const finalOut = `${synth.output}\n\n---\n\n<details: per-chunk results>\n\n${report}`;
-			deps.groups.finish(group.id, failed.size > 0 ? "succeeded" : "succeeded", capBytes(finalOut, cap * 4));
+			deps.groups.finish(group.id, finalStatus, capBytes(finalOut, cap * 4), finalNote);
 			return;
 		}
 	}
 
-	deps.groups.finish(group.id, "succeeded", report);
+	deps.groups.finish(group.id, finalStatus, report, finalNote);
 }
 
 // --- Prompt builders --------------------------------------------------------
@@ -275,12 +296,19 @@ function parseChunks(text: string, maxChunks: number): PlannedChunk[] {
 	const raw = extractJson<unknown>(text);
 	if (!Array.isArray(raw)) return [];
 	const chunks: PlannedChunk[] = [];
+	const usedIds = new Set<string>();
 	for (let i = 0; i < raw.length && chunks.length < maxChunks; i++) {
 		const item = raw[i] as Record<string, unknown>;
 		if (!item || typeof item !== "object") continue;
 		const task = typeof item.task === "string" ? item.task : typeof item.description === "string" ? item.description : "";
 		if (!task.trim()) continue;
-		const id = typeof item.id === "string" && item.id.trim() ? item.id.trim() : `c${chunks.length + 1}`;
+		// Ensure ids are unique so an explicit id and an auto-generated one cannot
+		// collide (which would collapse two chunks and silently drop one's work).
+		const base = typeof item.id === "string" && item.id.trim() ? item.id.trim() : `c${chunks.length + 1}`;
+		let id = base;
+		let suffix = 2;
+		while (usedIds.has(id)) id = `${base}-${suffix++}`;
+		usedIds.add(id);
 		const title = typeof item.title === "string" ? item.title : id;
 		const dependsOn = Array.isArray(item.dependsOn)
 			? item.dependsOn.filter((d): d is string => typeof d === "string")

@@ -2,15 +2,20 @@
  * Human-facing slash commands.
  *
  *   /swarm            - show the live dashboard of tasks and jobs
+ *   /swarm-config     - interactive menu to pick a model per agent type
  *   /swarm-cancel     - cancel a task/job/all
- *   /swarm-agents     - list available agent profiles
+ *   /swarm-agents     - list available agent profiles and their models
  *   /swarm-clear      - drop finished tasks/jobs from the registry
  */
 
-import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Markdown } from "@earendil-works/pi-tui";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { DynamicBorder, getAgentDir, getMarkdownTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, type SettingItem, SettingsList } from "@earendil-works/pi-tui";
+import { saveUserConfig } from "./config.ts";
 import { renderDashboard, type ThemeLike } from "./render.ts";
 import type { SwarmRuntime } from "./runtime.ts";
+import { ModelSelectSubmenu } from "./settings_ui.ts";
 
 export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 	// Renderer for the live dashboard (reads current registry state at render time).
@@ -69,15 +74,135 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 				ctx.ui.notify("No agent profiles found.", "warning");
 				return;
 			}
-			const lines = ["# Swarm agent profiles", ""];
+			const lines = ["# Swarm agent profiles", "", "_Set models per agent with `/swarm-config`._", ""];
 			for (const p of discovery.profiles) {
-				const bits = [p.model ? `model: ${p.model}` : "model: (inherit)"];
+				const override = rt.config.agentModels[p.name];
+				const effective = override || p.model || rt.config.defaultModel || "(inherit active model)";
+				const src = override ? "config" : p.model ? "profile" : rt.config.defaultModel ? "default" : "inherit";
+				const bits = [`model: ${effective} (${src})`];
 				if (p.tools) bits.push(`tools: ${p.tools.join(", ")}`);
 				lines.push(`- **${p.name}** _(${p.source})_ - ${p.description}`);
 				lines.push(`  - ${bits.join(" · ")}`);
 			}
 			if (discovery.projectAgentsDir) lines.push("", `Project agents dir: \`${discovery.projectAgentsDir}\``);
 			pi.sendMessage({ customType: "swarm-note", content: lines.join("\n"), display: true });
+		},
+	});
+
+	pi.registerCommand("swarm-config", {
+		description: "Configure swarm models per agent and general settings (interactive)",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/swarm-config requires interactive mode.", "warning");
+				return;
+			}
+
+			const registryModels = await getRegistryModels(ctx);
+			const extraModelIds = getEnabledModelIds();
+
+			const persist = () => {
+				saveUserConfig({
+					defaultModel: rt.config.defaultModel,
+					agentModels: rt.config.agentModels,
+					maxConcurrency: rt.config.maxConcurrency,
+					defaultAgentScope: rt.config.defaultAgentScope,
+					widget: rt.config.widget,
+					notifyOnComplete: rt.config.notifyOnComplete,
+				});
+			};
+
+			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+				const cfg = rt.config;
+				const discovery = rt.getDiscovery(cfg.defaultAgentScope);
+
+				const modelItem = (id: string, label: string, current: string): SettingItem => ({
+					id,
+					label,
+					currentValue: current || "(inherit)",
+					submenu: (currentVal, itemDone) =>
+						new ModelSelectSubmenu({
+							title: label,
+							currentValue: currentVal === "(inherit)" ? "" : currentVal,
+							theme,
+							registryModels,
+							extraModelIds,
+							onSelect: (value) => itemDone(value || "(inherit)"),
+							onCancel: () => itemDone(),
+						}),
+				});
+
+				const items: SettingItem[] = [
+					modelItem("model:__default__", "Default model (no-profile tasks)", cfg.defaultModel),
+					...discovery.profiles.map((p) => modelItem(`model:${p.name}`, `Agent: ${p.name}`, cfg.agentModels[p.name] ?? "")),
+					{
+						id: "maxConcurrency",
+						label: "Max concurrency",
+						currentValue: String(cfg.maxConcurrency),
+						values: ["1", "2", "3", "4", "6", "8", "12", "16"],
+					},
+					{
+						id: "defaultAgentScope",
+						label: "Agent scope",
+						currentValue: cfg.defaultAgentScope,
+						values: ["user", "project", "both"],
+					},
+					{ id: "widget", label: "Status widget", currentValue: cfg.widget ? "true" : "false", values: ["true", "false"] },
+					{
+						id: "notifyOnComplete",
+						label: "Notify on completion",
+						currentValue: cfg.notifyOnComplete ? "true" : "false",
+						values: ["true", "false"],
+					},
+				];
+
+				const onChange = (id: string, value: string) => {
+					if (id === "model:__default__") {
+						rt.config.defaultModel = value === "(inherit)" ? "" : value;
+					} else if (id.startsWith("model:")) {
+						const agent = id.slice("model:".length);
+						if (!value || value === "(inherit)") delete rt.config.agentModels[agent];
+						else rt.config.agentModels[agent] = value;
+					} else if (id === "maxConcurrency") {
+						const n = Number.parseInt(value, 10);
+						if (Number.isFinite(n)) rt.config.maxConcurrency = Math.max(1, Math.min(32, n));
+					} else if (id === "defaultAgentScope") {
+						if (value === "user" || value === "project" || value === "both") rt.config.defaultAgentScope = value;
+					} else if (id === "widget") {
+						rt.config.widget = value === "true";
+					} else if (id === "notifyOnComplete") {
+						rt.config.notifyOnComplete = value === "true";
+					} else {
+						return;
+					}
+					persist();
+					rt.refreshUI();
+				};
+
+				const baseTheme = getSettingsListTheme();
+				const settingsTheme = {
+					...baseTheme,
+					hint: (text: string) => baseTheme.hint(text.replace(/Esc to cancel/g, "Esc to close")),
+				};
+
+				const container = new Container();
+				container.addChild(new DynamicBorder((s) => theme.fg("border", s)));
+				const settingsList = new SettingsList(items, Math.min(items.length + 2, 14), settingsTheme, onChange, () => done(undefined));
+				container.addChild(settingsList);
+				container.addChild(new DynamicBorder((s) => theme.fg("border", s)));
+
+				return {
+					render(width: number) {
+						return container.render(width);
+					},
+					invalidate() {
+						container.invalidate();
+					},
+					handleInput(data: string) {
+						settingsList.handleInput?.(data);
+						tui.requestRender();
+					},
+				};
+			});
 		},
 	});
 
@@ -95,4 +220,39 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			ctx.ui.notify(`Cleared ${tasks} task(s) and ${groups} job(s). ${active} still active.`, "info");
 		},
 	});
+}
+
+/** Model objects with valid credentials (best effort; registry may be sync or async). */
+async function getRegistryModels(
+	ctx: ExtensionCommandContext,
+): Promise<Array<{ provider?: string; id?: string; name?: string }>> {
+	try {
+		const registry = ctx.modelRegistry as { getAvailable?: () => unknown } | undefined;
+		if (registry?.getAvailable) {
+			const raw = registry.getAvailable();
+			const arr = (Array.isArray(raw) ? raw : ((await raw) as unknown[] | undefined)) ?? [];
+			return (arr as Array<Record<string, unknown>>).map((m) => ({
+				provider: typeof m.provider === "string" ? m.provider : undefined,
+				id: typeof m.id === "string" ? m.id : undefined,
+				name: typeof m.name === "string" ? m.name : undefined,
+			}));
+		}
+	} catch {
+		// ignore
+	}
+	return [];
+}
+
+/** Curated "provider/id" model ids from settings.json enabledModels. */
+function getEnabledModelIds(): string[] {
+	try {
+		const raw = fs.readFileSync(path.join(getAgentDir(), "settings.json"), "utf-8");
+		const settings = JSON.parse(raw) as { enabledModels?: unknown };
+		if (Array.isArray(settings.enabledModels)) {
+			return settings.enabledModels.filter((m): m is string => typeof m === "string" && m.trim().length > 0);
+		}
+	} catch {
+		// ignore
+	}
+	return [];
 }
