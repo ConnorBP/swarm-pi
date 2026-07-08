@@ -1,0 +1,11 @@
+{
+	"defaultModel": "",
+	"maxConcurrency": 4,
+	"maxSpawnBatch": 16,
+	"defaultAgentScope": "user",
+	"perTaskOutputCap": 16384,
+	"widget": true,
+	"notifyOnComplete": false,
+	"confirmProjectAgents": true,
+	"agentDirs": []
+}

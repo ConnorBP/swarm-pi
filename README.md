@@ -1,0 +1,137 @@
+# swarm
+
+A sub-agent **orchestration toolkit** for the [pi](https://pi.dev) harness. It lets the agent
+delegate work to a swarm of isolated sub-agents, run declarative multi-stage
+workflows, and autonomously decompose large goals into validated, parallel,
+**asynchronously executed** chunks - then supervise and collect all of it over a
+long session.
+
+Each sub-agent runs in a **separate `pi` process** with its own context window, so
+delegated work never pollutes the orchestrator's context. Work runs in the
+**background** by default: the orchestrating agent spawns tasks, keeps thinking,
+and collects results later.
+
+## Install
+
+This is a directory extension. Place it at `~/.pi/agent/extensions/swarm/` (it
+is auto-discovered) and run `/reload` or restart pi. No build step is needed -
+pi loads TypeScript directly.
+
+## Tools (callable by the model)
+
+| Tool | Purpose |
+|------|---------|
+| `swarm_spawn` | Launch one or many sub-agents. Async by default (returns task ids); `wait: true` blocks and returns outputs. |
+| `swarm_status` | Poll task and job status (optionally filtered by ids or a job id). |
+| `swarm_await` | Block until targeted tasks/jobs finish and return their outputs. Esc stops waiting; tasks keep running. |
+| `swarm_result` | Fetch the full output of one finished task (`t#`) or job (`g#`). |
+| `swarm_cancel` | Stop running/queued tasks by ids, job, or `all: true`. |
+| `swarm_workflow` | Run a declarative multi-stage workflow (`task` / `map` / `reduce`). |
+| `swarm_orchestrate` | Auto-decompose a big goal into chunks, delegate in parallel, validate, and synthesize. |
+
+### Async by design
+
+`swarm_spawn`, `swarm_workflow`, and `swarm_orchestrate` return **immediately** with
+ids and run in the background across turns, bounded by a global concurrency
+limit. The orchestrator collects results whenever it wants:
+
+```
+swarm_spawn { tasks: [
+  { agent: "scout",  task: "Map all auth code and return file:line references" },
+  { agent: "scout",  task: "Map all billing code and return file:line references" }
+]}
+# ...keep working...
+swarm_await { }          # block for everything still active, get all outputs
+```
+
+### Workflows
+
+A workflow is an ordered list of steps with a barrier between each. Prompt
+templates may use `{goal}`, `{previous}`, `{steps.<id>}`, `{inputs}`, and inside a
+`map` step `{item}` / `{index}`.
+
+```json
+{
+  "spec": {
+    "name": "review-each-module",
+    "steps": [
+      { "id": "list",   "kind": "task",   "agent": "scout",
+        "prompt": "List each top-level module under src/, one per line." },
+      { "id": "review", "kind": "map",    "agent": "reviewer",
+        "itemsFromStep": "list",
+        "prompt": "Review module {item} for bugs and security issues." },
+      { "id": "sum",    "kind": "reduce", "agent": "synthesizer",
+        "prompt": "Combine these module reviews into one prioritized report:\n{inputs}" }
+    ]
+  },
+  "goal": "Security-review the codebase module by module"
+}
+```
+
+### Orchestration (auto-chunking + validation)
+
+`swarm_orchestrate` is the flagship for "do this big thing end to end and check it":
+
+1. a **planner** sub-agent decomposes the `goal` into self-contained chunks (JSON),
+2. **worker** sub-agents execute chunks in dependency-ordered parallel waves,
+3. a **reviewer** validates each chunk against `criteria` (failed chunks retry once with feedback),
+4. a **synthesizer** merges everything into a final deliverable.
+
+```
+swarm_orchestrate {
+  goal: "Add structured logging across the service and update the docs",
+  context: "Node/TypeScript service in src/. Logger lives in src/log.ts.",
+  criteria: "Every request handler logs start/end with a request id; docs/logging.md updated",
+  maxChunks: 6
+}
+```
+
+## Commands (for you)
+
+| Command | Purpose |
+|---------|---------|
+| `/swarm` | Live dashboard of tasks and jobs. |
+| `/swarm-cancel <taskId\|jobId\|all>` | Cancel work. |
+| `/swarm-agents` | List available agent profiles. |
+| `/swarm-clear` | Drop finished tasks/jobs from the registry. |
+
+## Agent profiles
+
+Profiles are markdown files with frontmatter (`name`, `description`, optional
+`tools`, optional `model`). Bundled defaults live in `swarm/agents/`
+(`planner`, `worker`, `reviewer`, `scout`, `synthesizer`) and inherit your active
+model unless a profile sets one. Override or add profiles in:
+
+- `~/.pi/agent/agents/*.md` (user)
+- `<project>/.pi/agents/*.md` (project - repo-controlled, confirmation-gated)
+
+Set `agentScope` to `user` (default), `project`, or `both` per call.
+
+## Configuration
+
+Defaults in `swarm/config.json`, overridable at `~/.pi/agent/swarm/config.json` and,
+for trusted projects, `<project>/.pi/swarm.json`:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `defaultModel` | `""` | Model for sub-agents; empty inherits your default. |
+| `maxConcurrency` | `4` | Max sub-agent processes running at once. |
+| `maxSpawnBatch` | `16` | Max tasks per `swarm_spawn` call. |
+| `defaultAgentScope` | `"user"` | Agent-profile scope. |
+| `perTaskOutputCap` | `16384` | Byte cap on per-task output returned to the model. |
+| `widget` | `true` | Show the live status widget (TUI). |
+| `notifyOnComplete` | `false` | Inject a follow-up note when all background work finishes. |
+| `confirmProjectAgents` | `true` | Confirm before running repo-controlled agents. |
+| `agentDirs` | `[]` | Extra directories to search for profiles. |
+
+## State & durability
+
+Task/job snapshots are written under `~/.pi/agent/swarm/<session>/`. After a
+`/reload`, prior history is recovered so `/swarm` and `swarm_result` keep working;
+tasks that were mid-flight in a previous process are marked `detached`.
+
+## Security
+
+Each sub-agent is a real `pi` process with the tools you grant it. Project-local
+agent profiles are repo-controlled and gated behind a confirmation. Only enable
+`project`/`both` scope for repositories you trust.
