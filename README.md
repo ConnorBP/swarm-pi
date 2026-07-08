@@ -24,6 +24,7 @@ pi loads TypeScript directly.
 | `swarm_spawn` | Launch one or many sub-agents. Async by default (returns task ids); `wait: true` blocks and returns outputs. |
 | `swarm_status` | Poll task and job status (optionally filtered by ids or a job id). |
 | `swarm_await` | Block until targeted tasks/jobs finish and return their outputs. Esc stops waiting; tasks keep running. |
+| `swarm_watch` | **Non-blocking**: be re-activated when watched work finishes (or after a timer) instead of blocking. |
 | `swarm_result` | Fetch the full output of one finished task (`t#`) or job (`g#`). |
 | `swarm_cancel` | Stop running/queued tasks by ids, job, or `all: true`. |
 | `swarm_workflow` | Run a declarative multi-stage workflow (`task` / `map` / `reduce`). |
@@ -43,6 +44,32 @@ swarm_spawn { tasks: [
 # ...keep working...
 swarm_await { }          # block for everything still active, get all outputs
 ```
+
+### Non-blocking orchestration (don't sit on "Working...")
+
+`swarm_await` blocks the session. For long work, spawn async and let completions
+re-activate the model instead:
+
+```
+swarm_orchestrate { goal: "...", notify: true }   # returns a job id, sets a watch
+# the model ends its turn (e.g. "dispatched - I'll report when done")
+# ...when the job finishes, the agent is re-activated with a status summary...
+```
+
+`swarm_watch` is the general primitive. It registers a wake-up and returns
+immediately so the model can end its turn (or keep doing other management); the
+extension re-activates it via `pi.sendMessage({ triggerTurn: true })` when the
+condition is met:
+
+- `swarm_watch { group: "g1" }` - wake when that job finishes
+- `swarm_watch { ids: ["t3","t4"] }` - wake when those tasks finish
+- `swarm_watch { all: true }` - wake when all active swarm work finishes
+- `swarm_watch { checkInMs: 30000 }` - a timed check-back (poll on a timer)
+- `mode: "steer"` interrupts the current turn instead of waiting for it to finish
+
+`swarm_spawn`, `swarm_workflow`, and `swarm_orchestrate` all accept `notify: true`
+as a shorthand that sets the matching watch for you. Watching already-finished
+work returns "already complete" rather than firing, so there is no busy loop.
 
 ### Workflows
 
@@ -142,7 +169,20 @@ for trusted projects, `<project>/.pi/swarm.json`:
 | `widget` | `true` | Show the live status widget (TUI). |
 | `notifyOnComplete` | `false` | Inject a follow-up note when all background work finishes. |
 | `confirmProjectAgents` | `true` | Confirm before running repo-controlled agents. |
+| `countSubagentCost` | `true` | Fold sub-agent spend into pi's session cost counter (money only). |
 | `agentDirs` | `[]` | Extra directories to search for profiles. |
+
+## Cost accounting
+
+Each sub-agent runs as its own `pi` process, so its spend is normally invisible to
+pi's session cost counter. With `countSubagentCost` on (default), the swarm
+accumulates completed sub-agent cost and folds it into the next assistant
+message's `usage.cost.total`, so the footer's session `$` total includes swarm
+spend. Only the money is adjusted; token and context counters are left untouched
+so context/compaction accounting stays accurate. A side effect is that the single
+assistant message the cost lands on shows an inflated per-message cost; the
+session total is what stays correct. `/swarm` still reports swarm-only spend
+separately.
 
 ## State & durability
 

@@ -28,6 +28,11 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 		return new Markdown(String(message.content ?? ""), 0, 0, getMarkdownTheme());
 	});
 
+	// Renderer for wake-up / re-activation messages injected when watched work finishes.
+	pi.registerMessageRenderer("swarm-wake", (message, _options, _theme) => {
+		return new Markdown(String(message.content ?? ""), 0, 0, getMarkdownTheme());
+	});
+
 	pi.registerCommand("swarm", {
 		description: "Show the swarm dashboard (tasks and jobs)",
 		handler: async (_args, ctx) => {
@@ -108,6 +113,7 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 					defaultAgentScope: rt.config.defaultAgentScope,
 					widget: rt.config.widget,
 					notifyOnComplete: rt.config.notifyOnComplete,
+					countSubagentCost: rt.config.countSubagentCost,
 				});
 			};
 
@@ -153,6 +159,12 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						currentValue: cfg.notifyOnComplete ? "true" : "false",
 						values: ["true", "false"],
 					},
+					{
+						id: "countSubagentCost",
+						label: "Count sub-agent cost in session $",
+						currentValue: cfg.countSubagentCost ? "true" : "false",
+						values: ["true", "false"],
+					},
 				];
 
 				const onChange = (id: string, value: string) => {
@@ -171,6 +183,8 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						rt.config.widget = value === "true";
 					} else if (id === "notifyOnComplete") {
 						rt.config.notifyOnComplete = value === "true";
+					} else if (id === "countSubagentCost") {
+						rt.config.countSubagentCost = value === "true";
 					} else {
 						return;
 					}

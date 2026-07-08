@@ -8,5 +8,6 @@
 	"widget": true,
 	"notifyOnComplete": false,
 	"confirmProjectAgents": true,
+	"countSubagentCost": true,
 	"agentDirs": []
 }

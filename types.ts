@@ -167,6 +167,8 @@ export interface SwarmConfig {
 	notifyOnComplete: boolean;
 	/** Confirm before running project-local agent profiles. */
 	confirmProjectAgents: boolean;
+	/** Fold sub-agent spend into pi's session cost counter (money only). */
+	countSubagentCost: boolean;
 	/** Extra directories to search for agent profiles. */
 	agentDirs: string[];
 }

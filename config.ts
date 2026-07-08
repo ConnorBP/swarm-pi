@@ -23,6 +23,7 @@ export const DEFAULT_CONFIG: SwarmConfig = {
 	widget: true,
 	notifyOnComplete: false,
 	confirmProjectAgents: true,
+	countSubagentCost: true,
 	agentDirs: [],
 };
 

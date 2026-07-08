@@ -108,7 +108,7 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 		promptSnippet: "Delegate work to background sub-agents (single or parallel), async or blocking",
 		promptGuidelines: [
 			"Use swarm_spawn to parallelize independent sub-tasks across isolated sub-agents instead of doing them sequentially yourself.",
-			"Prefer async swarm_spawn (wait omitted) for long work: spawn, continue reasoning, then swarm_await when you need the results.",
+			"For long work, prefer async swarm_spawn (wait omitted) with notify: true (or a follow-up swarm_watch), then END YOUR TURN - you will be re-activated with results when the tasks finish. Do not block in swarm_await for long jobs.",
 		],
 		parameters: Type.Object({
 			tasks: Type.Optional(Type.Array(TaskItemSchema, { description: "Parallel sub-agent tasks." })),
@@ -120,6 +120,7 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			cwd: Type.Optional(Type.String({ description: "Single-task shorthand: working directory." })),
 			agentScope: Type.Optional(AgentScopeSchema),
 			wait: Type.Optional(Type.Boolean({ description: "Block until all tasks finish (default false = async background)." })),
+			notify: Type.Optional(Type.Boolean({ description: "When async, auto-register a watch so you are re-activated when these tasks finish (lets you end your turn instead of blocking)." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const scope: AgentScope = params.agentScope ?? rt.config.defaultAgentScope;
@@ -163,10 +164,18 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			const ids = records.map((r) => r.id);
 
 			if (!params.wait) {
-				const text = [
-					`Spawned ${ids.length} background sub-agent task(s): ${ids.join(", ")}.`,
-					"They run asynchronously. Use swarm_status to poll, swarm_await to block for results, swarm_result for one task.",
-				].join("\n");
+				let watchNote = "Use swarm_status to poll, swarm_await to block for results, or swarm_watch to be re-activated when they finish.";
+				if (params.notify) {
+					try {
+						const watchId = rt.watch.add({ ids });
+						watchNote = watchId
+							? `A watch (${watchId}) is set: you can end your turn now and will be re-activated when these tasks finish. No need to block.`
+							: "These tasks already finished; read their output now with swarm_await/swarm_result.";
+					} catch {
+						// max watches reached, etc.; fall back to the default note
+					}
+				}
+				const text = [`Spawned ${ids.length} background sub-agent task(s): ${ids.join(", ")}.`, watchNote].join("\n");
 				return { content: [{ type: "text", text }], details: { taskIds: ids, mode: "async" } };
 			}
 
@@ -242,8 +251,9 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			"Block until targeted background tasks (or a job) complete, then return their outputs.",
 			"Target by task `ids`, a `group` job id, or nothing to await all currently-active work.",
 			"Press Esc to stop waiting (tasks keep running in the background).",
+			"Note: this BLOCKS the session on 'Working...'. For long jobs prefer swarm_watch (or spawn with notify: true) so you can end your turn and be re-activated when the work finishes.",
 		].join(" "),
-		promptSnippet: "Wait for background swarm work to finish and collect results",
+		promptSnippet: "Wait (blocking) for background swarm work to finish and collect results",
 		parameters: Type.Object({
 			ids: Type.Optional(Type.Array(Type.String(), { description: "Task ids to await." })),
 			group: Type.Optional(Type.String({ description: "Job/group id to await." })),
@@ -388,6 +398,66 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 		},
 	});
 
+	// --- swarm_watch ---------------------------------------------------------
+	pi.registerTool({
+		name: "swarm_watch",
+		label: "Swarm Watch",
+		description: [
+			"Ask to be re-activated later instead of blocking. Registers a wake-up that resumes your turn (with a status summary) when the watched work finishes, or after a timer.",
+			"Target by task `ids`, a `group` job id, `all` active work, and/or `checkInMs` for a timed check-back.",
+			"After calling this you can END YOUR TURN (e.g. tell the user what you dispatched). You will be re-activated automatically - no need to sit blocked in swarm_await.",
+		].join(" "),
+		promptSnippet: "Be re-activated when background swarm work finishes or a timer elapses (non-blocking)",
+		promptGuidelines: [
+			"Use swarm_watch to run a non-blocking orchestration loop: spawn async, set a swarm_watch, end your turn; when work completes you are woken with results and can dispatch more, validate, or report.",
+			"Prefer swarm_watch over swarm_await for anything long-running so the session is not stuck on 'Working...'. Use checkInMs to poll on a timer if you want periodic check-ins.",
+		],
+		parameters: Type.Object({
+			ids: Type.Optional(Type.Array(Type.String(), { description: "Wake when all these tasks finish." })),
+			group: Type.Optional(Type.String({ description: "Wake when this job (workflow/orchestration) finishes." })),
+			all: Type.Optional(Type.Boolean({ description: "Wake when ALL active swarm work finishes." })),
+			checkInMs: Type.Optional(Type.Number({ description: "Also wake after this many ms (a timed check-back), even if work is unfinished. Clamped to 1s..1h." })),
+			mode: Type.Optional(StringEnum(["wake", "steer"] as const, { description: "wake = resume when idle (default); steer = interrupt the current turn." })),
+			note: Type.Optional(Type.String({ description: "A short note to yourself about why you are waiting (echoed back on wake)." })),
+		}),
+		async execute(_id, params) {
+			const watchId = rt.watch.add({
+				ids: params.ids,
+				group: params.group,
+				all: params.all,
+				checkInMs: params.checkInMs,
+				mode: params.mode,
+				note: params.note,
+			});
+			if (!watchId) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "That work is already complete - no watch needed. Use swarm_status / swarm_result to review the results now.",
+						},
+					],
+					details: { alreadyComplete: true },
+				};
+			}
+			const parts: string[] = [];
+			if (params.ids?.length) parts.push(`tasks ${params.ids.join(", ")}`);
+			if (params.group) parts.push(`job ${params.group}`);
+			if (params.all) parts.push("all active work");
+			const cond = parts.join(" / ") || "the requested condition";
+			const timer = params.checkInMs ? ` (or after ${params.checkInMs}ms)` : "";
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Watch ${watchId} set. You will be re-activated when ${cond} completes${timer}. End your turn now - you do not need to block.`,
+					},
+				],
+				details: { watchId },
+			};
+		},
+	});
+
 	registerWorkflowTool(pi, rt);
 	registerOrchestrateTool(pi, rt);
 }
@@ -429,6 +499,7 @@ function registerWorkflowTool(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			),
 			goal: Type.Optional(Type.String({ description: "Top-level goal, available to every step as {goal}." })),
 			wait: Type.Optional(Type.Boolean({ description: "Block until the workflow finishes (default false)." })),
+			notify: Type.Optional(Type.Boolean({ description: "When async, auto-register a watch so you are re-activated when the workflow finishes." })),
 		}),
 		async execute(_id, params, signal) {
 			const spec = params.spec as WorkflowSpec;
@@ -436,8 +507,17 @@ function registerWorkflowTool(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			if (err) throw new Error(`Invalid workflow: ${err}`);
 			const group = startWorkflow(rt.coordinatorDeps(), spec, params.goal ?? spec.name ?? "workflow");
 			if (!params.wait) {
+				let note = `Poll with swarm_status group="${group.id}", block with swarm_await group="${group.id}", or swarm_watch group="${group.id}" to be re-activated when it finishes.`;
+				if (params.notify) {
+					try {
+						rt.watch.add({ group: group.id });
+						note = `A watch is set: end your turn and you will be re-activated when job ${group.id} finishes.`;
+					} catch {
+						// fall back to default note
+					}
+				}
 				return {
-					content: [{ type: "text", text: `Started workflow job ${group.id} (${spec.steps.length} steps) in the background. Poll with swarm_status group="${group.id}" or block with swarm_await group="${group.id}".` }],
+					content: [{ type: "text", text: `Started workflow job ${group.id} (${spec.steps.length} steps) in the background. ${note}` }],
 					details: { groupIds: [group.id] },
 				};
 			}
@@ -488,6 +568,7 @@ function registerOrchestrateTool(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			tools: Type.Optional(Type.Array(Type.String(), { description: "Tool allowlist for worker sub-agents." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory for sub-agents." })),
 			wait: Type.Optional(Type.Boolean({ description: "Block until the job finishes (default false)." })),
+			notify: Type.Optional(Type.Boolean({ description: "When async, auto-register a watch so you are re-activated when the job finishes." })),
 		}),
 		async execute(_id, params, signal) {
 			const group = startOrchestration(rt.coordinatorDeps(), {
@@ -507,8 +588,17 @@ function registerOrchestrateTool(pi: ExtensionAPI, rt: SwarmRuntime): void {
 				cwd: params.cwd,
 			});
 			if (!params.wait) {
+				let note = `Poll with swarm_status group="${group.id}", block with swarm_await group="${group.id}", or swarm_watch group="${group.id}" to be re-activated when it finishes.`;
+				if (params.notify) {
+					try {
+						rt.watch.add({ group: group.id });
+						note = `A watch is set: end your turn and you will be re-activated when job ${group.id} finishes.`;
+					} catch {
+						// fall back to default note
+					}
+				}
 				return {
-					content: [{ type: "text", text: `Started orchestration job ${group.id} in the background. It will plan, delegate, validate, and synthesize. Poll with swarm_status group="${group.id}" or block with swarm_await group="${group.id}".` }],
+					content: [{ type: "text", text: `Started orchestration job ${group.id} in the background. It will plan, delegate, validate, and synthesize. ${note}` }],
 					details: { groupIds: [group.id] },
 				};
 			}
