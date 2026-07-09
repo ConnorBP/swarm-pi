@@ -54,20 +54,26 @@ export class ComplexityModel {
 	}
 
 	private load(): void {
-		this.buckets.clear();
+		// Parse into a local map and commit only on a fully successful read, so a
+		// transient read/parse error never wipes the in-memory model (which record()
+		// would then persist as a near-empty file, losing all learned history).
+		const next = new Map<number, ComplexityBucket>();
 		try {
-			if (!fs.existsSync(this.file)) return;
+			if (!fs.existsSync(this.file)) {
+				// No persisted data yet: keep whatever we have (empty on first load).
+				return;
+			}
 			const parsed = JSON.parse(fs.readFileSync(this.file, "utf-8")) as Persisted;
 			if (!parsed || typeof parsed !== "object" || !parsed.buckets) return;
 			for (const [key, bucket] of Object.entries(parsed.buckets)) {
 				const c = Number(key);
 				if (Number.isInteger(c) && c >= 0 && c <= 10 && isValidBucket(bucket)) {
-					this.buckets.set(c, bucket);
+					next.set(c, bucket);
 				}
 			}
+			this.buckets = next;
 		} catch {
-			// start fresh on corrupt data
-			this.buckets.clear();
+			// Keep the current in-memory model on error rather than clobbering it.
 		}
 	}
 
@@ -90,8 +96,10 @@ export class ComplexityModel {
 		if (c === undefined) return;
 		if (!Number.isFinite(durationMs) || durationMs <= 0) return;
 
-		// Refresh from disk first so concurrent pi sessions accumulate additively
-		// (last-writer-wins would otherwise drop the other session's samples).
+		// Refresh from disk first so concurrent pi sessions mostly accumulate rather
+		// than last-writer-wins. This narrows (does not fully eliminate) the race: a
+		// tight overlap where both sessions load before either saves can still drop a
+		// single sample. Acceptable for a self-healing timing heuristic.
 		this.load();
 
 		const existing = this.buckets.get(c);

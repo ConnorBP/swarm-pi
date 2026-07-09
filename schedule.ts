@@ -197,8 +197,12 @@ export class Scheduler {
 	private arm(record: ScheduleRecord, overrideDelayMs?: number): void {
 		this.disarm(record.id);
 		const now = this.deps.now();
-		const target = overrideDelayMs !== undefined ? now + overrideDelayMs : (record.nextRunAt ?? now + record.everyMs);
-		const remaining = Math.max(MIN_INTERVAL_MS, target - now);
+		// An explicit override (e.g. the catch-up delay) is honored exactly; the
+		// MIN_INTERVAL_MS floor only guards against a runaway fast repeating cadence.
+		const remaining =
+			overrideDelayMs !== undefined
+				? Math.max(0, overrideDelayMs)
+				: Math.max(MIN_INTERVAL_MS, (record.nextRunAt ?? now + record.everyMs) - now);
 
 		if (remaining > TIMER_MAX_MS) {
 			// Too far out for a single setTimeout (would overflow to ~1ms). Hop, then
