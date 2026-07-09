@@ -54,6 +54,12 @@ export interface TaskRecord {
 	logPath?: string;
 	/** Grouping for workflow / orchestration coordinators. */
 	groupId?: string;
+	/** Model-estimated complexity 0-10, used for duration estimates and escalation. */
+	complexity?: number;
+	/** Estimated duration (ms) from the complexity model at spawn time. */
+	estimatedMs?: number;
+	/** True once this task has been flagged/handled for overrun escalation. */
+	escalated?: boolean;
 	/** Free-form coordinator metadata (step id, chunk id, attempt, role, ...). */
 	meta?: Record<string, unknown>;
 }
@@ -73,6 +79,8 @@ export interface GroupRecord {
 	/** Short human-readable progress note (e.g. "step 2/4: map(6)"). */
 	note?: string;
 	errorMessage?: string;
+	/** Model-estimated complexity 0-10 for the overall job. */
+	complexity?: number;
 	meta?: Record<string, unknown>;
 }
 
@@ -85,6 +93,8 @@ export interface SpawnSpec {
 	tools?: string[];
 	cwd?: string;
 	groupId?: string;
+	/** Estimated complexity 0-10, drives duration estimates and overrun escalation. */
+	complexity?: number;
 	meta?: Record<string, unknown>;
 	/** Which agent directories to search for `agent`. Defaults to config. */
 	agentScope?: "user" | "project" | "both";
@@ -135,6 +145,8 @@ export interface OrchestrateSpec {
 	model?: string;
 	tools?: string[];
 	cwd?: string;
+	/** Overall complexity 0-10 (recorded on the job). */
+	complexity?: number;
 }
 
 /** A planned chunk emitted by the planner sub-agent. */
@@ -143,6 +155,8 @@ export interface PlannedChunk {
 	title: string;
 	task: string;
 	dependsOn: string[];
+	/** Planner-estimated complexity 0-10 for this chunk. */
+	complexity?: number;
 }
 
 export interface SwarmConfig {
@@ -169,6 +183,46 @@ export interface SwarmConfig {
 	confirmProjectAgents: boolean;
 	/** Fold sub-agent spend into pi's session cost counter (money only). */
 	countSubagentCost: boolean;
+	/** Allow the model (not just the user) to create/manage scheduled tasks. */
+	allowModelScheduling: boolean;
+	/** What to do when a task overruns its estimate: off | notify | auto (re-chunk). */
+	escalation: "off" | "notify" | "auto";
+	/** Escalate when elapsed exceeds this multiple of the estimated duration. */
+	escalationFactor: number;
+	/** Minimum recorded samples at a complexity before its estimate drives escalation. */
+	escalationMinSamples: number;
 	/** Extra directories to search for agent profiles. */
 	agentDirs: string[];
+}
+
+/** An action a schedule fires: spawn work, orchestrate, or prompt the main agent. */
+export type ScheduleAction =
+	| { type: "spawn"; task: string; agent?: string; model?: string; tools?: string[]; cwd?: string; complexity?: number }
+	| { type: "orchestrate"; goal: string; criteria?: string; maxChunks?: number; complexity?: number; cwd?: string }
+	| { type: "prompt"; text: string; mode?: "wake" | "steer" };
+
+/** A recurring scheduled task (fires while pi is running). */
+export interface ScheduleRecord {
+	id: string;
+	name: string;
+	everyMs: number;
+	action: ScheduleAction;
+	enabled: boolean;
+	createdBy: "user" | "model";
+	createdAt: number;
+	lastRunAt?: number;
+	nextRunAt?: number;
+	runCount: number;
+	/** Run once at the next due time even if pi was off when it was due. */
+	catchUp?: boolean;
+}
+
+/** Learned duration statistics for one complexity bucket (0-10). */
+export interface ComplexityBucket {
+	count: number;
+	totalMs: number;
+	meanMs: number;
+	minMs: number;
+	maxMs: number;
+	lastMs: number;
 }

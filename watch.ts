@@ -45,8 +45,8 @@ export interface WatchDeps {
 	maxWatches: number;
 }
 
-const MIN_CHECK_MS = 1000;
-const MAX_CHECK_MS = 60 * 60 * 1000;
+export const MIN_CHECK_MS = 1000;
+export const MAX_CHECK_MS = 60 * 60 * 1000;
 
 export class WatchManager {
 	private readonly deps: WatchDeps;

@@ -9,5 +9,9 @@
 	"notifyOnComplete": false,
 	"confirmProjectAgents": true,
 	"countSubagentCost": true,
+	"allowModelScheduling": false,
+	"escalation": "notify",
+	"escalationFactor": 2,
+	"escalationMinSamples": 3,
 	"agentDirs": []
 }

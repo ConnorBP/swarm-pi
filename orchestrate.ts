@@ -13,6 +13,7 @@
  * spawns it, keeps working, then awaits or polls it.
  */
 
+import { clampComplexity } from "./complexity.ts";
 import type { GroupRecord, GroupStatus, OrchestrateSpec, PlannedChunk, TaskRecord } from "./types.ts";
 import { capBytes, extractJson, mapWithConcurrency } from "./util.ts";
 import type { CoordinatorDeps } from "./workflow.ts";
@@ -25,11 +26,45 @@ export function startOrchestration(deps: CoordinatorDeps, spec: OrchestrateSpec)
 		validate: spec.validate !== false,
 		synthesize: spec.synthesize !== false,
 	});
+	group.complexity = clampComplexity(spec.complexity);
+	deps.groups.update(group);
 
 	void runOrchestration(deps, spec, group).catch((err) => {
 		deps.groups.finish(group.id, "failed", group.output, `Orchestration crashed: ${(err as Error).message}`);
 	});
 
+	return group;
+}
+
+/**
+ * Stop a task that has run too long and re-chunk its remaining work across a
+ * fresh orchestration, seeded with the original task and whatever partial output
+ * the stopped agent produced. Returns the new job.
+ */
+export function rechunkTask(
+	deps: CoordinatorDeps,
+	task: TaskRecord,
+	opts?: { maxChunks?: number; cancel?: boolean; criteria?: string },
+): GroupRecord {
+	if (opts?.cancel !== false && (task.status === "running" || task.status === "queued")) {
+		deps.runner.cancel(task.id, "re-chunked: running too long / too complex for one agent");
+	}
+	const cap = deps.config.perTaskOutputCap;
+	const partial = task.output?.trim();
+	const context = partial
+		? `A single agent already worked on this but was stopped for running too long. Its partial progress follows - do NOT redo finished parts, only complete what remains:\n\n${capBytes(partial, cap)}`
+		: "A single agent attempt was stopped for running too long; no usable partial output was captured. Decompose and complete the task from scratch.";
+
+	const group = startOrchestration(deps, {
+		goal: task.task,
+		context,
+		criteria: opts?.criteria,
+		maxChunks: opts?.maxChunks,
+		complexity: task.complexity,
+		cwd: task.cwd,
+	});
+	group.meta = { ...group.meta, rechunkOf: task.id };
+	deps.groups.update(group);
 	return group;
 }
 
@@ -44,8 +79,9 @@ async function runOrchestration(deps: CoordinatorDeps, spec: OrchestrateSpec, gr
 		agent: string | undefined,
 		label: string,
 		meta: Record<string, unknown>,
+		complexity?: number,
 	): Promise<TaskRecord> => {
-		const record = deps.runner.enqueue({ task, agent, label, model: spec.model, tools: spec.tools, cwd, groupId: group.id, meta });
+		const record = deps.runner.enqueue({ task, agent, label, model: spec.model, tools: spec.tools, cwd, groupId: group.id, meta, complexity });
 		group.taskIds.push(record.id);
 		deps.groups.update(group);
 		const [done] = await deps.runner.waitFor([record.id]);
@@ -94,10 +130,13 @@ async function runOrchestration(deps: CoordinatorDeps, spec: OrchestrateSpec, gr
 
 		const waveResults = await mapWithConcurrency(ready, concurrency, async (chunk) => {
 			const prompt = buildWorkerPrompt(chunk, spec, results, cap);
-			const record = await enqueueAndWait(prompt, spec.workerAgent ?? "worker", chunk.title || chunk.id, {
-				role: "worker",
-				chunk: chunk.id,
-			});
+			const record = await enqueueAndWait(
+				prompt,
+				spec.workerAgent ?? "worker",
+				chunk.title || chunk.id,
+				{ role: "worker", chunk: chunk.id },
+				chunk.complexity ?? spec.complexity,
+			);
 			return { chunk, record };
 		});
 		for (const { chunk, record } of waveResults) {
@@ -139,10 +178,13 @@ async function runOrchestration(deps: CoordinatorDeps, spec: OrchestrateSpec, gr
 			deps.groups.update(group);
 			await mapWithConcurrency(failedValidation, concurrency, async ({ chunk, feedback }) => {
 				const prompt = buildRetryPrompt(chunk, spec, results, feedback, cap);
-				const record = await enqueueAndWait(prompt, spec.workerAgent ?? "worker", `retry:${chunk.title || chunk.id}`, {
-					role: "worker-retry",
-					chunk: chunk.id,
-				});
+				const record = await enqueueAndWait(
+					prompt,
+					spec.workerAgent ?? "worker",
+					`retry:${chunk.title || chunk.id}`,
+					{ role: "worker-retry", chunk: chunk.id },
+					chunk.complexity ?? spec.complexity,
+				);
 				results.set(chunk.id, record);
 				if (record.status !== "succeeded") {
 					succeeded.delete(chunk.id);
@@ -208,9 +250,10 @@ function buildPlannerPrompt(spec: OrchestrateSpec, maxChunks: number): string {
 		"- Each chunk must be self-contained: a fresh agent that has NOT seen this conversation must be able to execute it from the chunk text alone. Include concrete paths, names, and requirements.",
 		"- Prefer independent chunks. Only set dependsOn when a chunk genuinely needs another chunk's result.",
 		"- Do NOT do the work now. Only plan.",
+		"- For each chunk include `complexity`: an integer 0 (trivial) to 10 (very hard) estimating how hard/long that chunk is for a single agent.",
 		"",
 		"Output ONLY a JSON array (no prose, no code fence needed) in exactly this shape:",
-		'[{"id":"c1","title":"short title","task":"detailed self-contained instructions","dependsOn":[]}]',
+		'[{"id":"c1","title":"short title","task":"detailed self-contained instructions","dependsOn":[],"complexity":5}]',
 	);
 	return lines.join("\n");
 }
@@ -313,7 +356,8 @@ function parseChunks(text: string, maxChunks: number): PlannedChunk[] {
 		const dependsOn = Array.isArray(item.dependsOn)
 			? item.dependsOn.filter((d): d is string => typeof d === "string")
 			: [];
-		chunks.push({ id, title, task, dependsOn });
+		const complexity = typeof item.complexity === "number" ? clampComplexity(item.complexity) : undefined;
+		chunks.push({ id, title, task, dependsOn, complexity });
 	}
 	// Drop self-references and unknown dep ids to avoid deadlocks.
 	const ids = new Set(chunks.map((c) => c.id));

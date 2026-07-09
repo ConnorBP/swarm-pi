@@ -164,6 +164,40 @@ export async function mapWithConcurrency<TIn, TOut>(
 	return results;
 }
 
+/**
+ * Parse a human duration like "45s", "30m", "2h", "1d", "90" (bare = minutes),
+ * or "1500ms" into milliseconds. Returns undefined if it cannot be parsed.
+ */
+export function parseDuration(text: string): number | undefined {
+	const trimmed = text.trim().toLowerCase();
+	const match = trimmed.match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/);
+	if (!match) return undefined;
+	const value = Number(match[1]);
+	if (!Number.isFinite(value) || value < 0) return undefined;
+	switch (match[2]) {
+		case "ms":
+			return value;
+		case "s":
+			return value * 1000;
+		case "h":
+			return value * 60 * 60 * 1000;
+		case "d":
+			return value * 24 * 60 * 60 * 1000;
+		default:
+			// bare number or "m" -> minutes
+			return value * 60 * 1000;
+	}
+}
+
+/** Format a millisecond interval as a compact human string ("2h", "30m"). */
+export function formatInterval(ms: number): string {
+	if (ms % (24 * 60 * 60 * 1000) === 0) return `${ms / (24 * 60 * 60 * 1000)}d`;
+	if (ms % (60 * 60 * 1000) === 0) return `${ms / (60 * 60 * 1000)}h`;
+	if (ms % (60 * 1000) === 0) return `${ms / (60 * 1000)}m`;
+	if (ms % 1000 === 0) return `${ms / 1000}s`;
+	return `${ms}ms`;
+}
+
 export function statusIcon(status: string): string {
 	switch (status) {
 		case "queued":

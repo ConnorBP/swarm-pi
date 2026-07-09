@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentProfile, AgentScope } from "./agents.ts";
+import { clampComplexity } from "./complexity.ts";
 import type { SwarmStore } from "./store.ts";
 import type { SpawnSpec, SwarmConfig, TaskRecord } from "./types.ts";
 import { collectToolCalls, emptyUsage, finalAssistantText } from "./util.ts";
@@ -38,6 +39,8 @@ export interface RunnerDeps {
 	onChange: () => void;
 	onTaskComplete?: (record: TaskRecord) => void;
 	appendEntry?: (record: TaskRecord) => void;
+	/** Estimated duration (ms) for a complexity score, from the learned model. */
+	estimateMs?: (complexity: number) => number;
 }
 
 /** Resolve how to re-invoke the running `pi` binary for a child process. */
@@ -121,6 +124,8 @@ export class SwarmRunner {
 		const configModel = spec.agent ? this.deps.config.agentModels?.[spec.agent] : undefined;
 		const model = spec.model ?? (configModel || undefined) ?? profile?.model ?? (this.deps.config.defaultModel || undefined);
 		const tools = spec.tools ?? profile?.tools;
+		const complexity = clampComplexity(spec.complexity);
+		const estimatedMs = complexity !== undefined ? this.deps.estimateMs?.(complexity) : undefined;
 
 		const record: TaskRecord = {
 			id,
@@ -138,6 +143,8 @@ export class SwarmRunner {
 			usage: emptyUsage(),
 			logPath: this.deps.store.taskLogPath(id),
 			groupId: spec.groupId,
+			complexity,
+			estimatedMs,
 			meta: { ...spec.meta, agentScope: scope },
 		};
 

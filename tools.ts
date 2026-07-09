@@ -15,11 +15,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { AgentScope } from "./agents.ts";
-import { startOrchestration } from "./orchestrate.ts";
+import { rechunkTask, startOrchestration } from "./orchestrate.ts";
 import { renderDashboard, renderTaskResult } from "./render.ts";
 import type { SwarmRuntime } from "./runtime.ts";
-import type { GroupRecord, SpawnSpec, TaskRecord, WorkflowSpec } from "./types.ts";
-import { capBytes, formatDuration, formatUsage } from "./util.ts";
+import type { GroupRecord, ScheduleAction, SpawnSpec, TaskRecord, WorkflowSpec } from "./types.ts";
+import { capBytes, formatDuration, formatInterval, formatUsage } from "./util.ts";
+import { MAX_CHECK_MS, MIN_CHECK_MS } from "./watch.ts";
 import { startWorkflow, validateWorkflow } from "./workflow.ts";
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -33,6 +34,7 @@ const TaskItemSchema = Type.Object({
 	model: Type.Optional(Type.String({ description: 'Model override "provider/id" (default inherits your model).' })),
 	tools: Type.Optional(Type.Array(Type.String(), { description: "Allowlist of tools for this sub-agent." })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for this sub-agent." })),
+	complexity: Type.Optional(Type.Number({ description: "Estimated difficulty 0 (trivial) to 10 (very hard); drives duration estimates and overrun escalation." })),
 });
 
 function plainTaskLine(r: TaskRecord): string {
@@ -118,6 +120,7 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			model: Type.Optional(Type.String({ description: "Single-task shorthand: model override." })),
 			tools: Type.Optional(Type.Array(Type.String(), { description: "Single-task shorthand: tool allowlist." })),
 			cwd: Type.Optional(Type.String({ description: "Single-task shorthand: working directory." })),
+			complexity: Type.Optional(Type.Number({ description: "Single-task shorthand: estimated difficulty 0-10 (drives duration estimates and escalation)." })),
 			agentScope: Type.Optional(AgentScopeSchema),
 			wait: Type.Optional(Type.Boolean({ description: "Block until all tasks finish (default false = async background)." })),
 			notify: Type.Optional(Type.Boolean({ description: "When async, auto-register a watch so you are re-activated when these tasks finish (lets you end your turn instead of blocking)." })),
@@ -127,10 +130,10 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			const specs: SpawnSpec[] = [];
 			if (params.tasks && params.tasks.length > 0) {
 				for (const t of params.tasks) {
-					specs.push({ task: t.task, agent: t.agent, label: t.label, model: t.model, tools: t.tools, cwd: t.cwd, agentScope: scope });
+					specs.push({ task: t.task, agent: t.agent, label: t.label, model: t.model, tools: t.tools, cwd: t.cwd, complexity: t.complexity, agentScope: scope });
 				}
 			} else if (params.task) {
-				specs.push({ task: params.task, agent: params.agent, label: params.label, model: params.model, tools: params.tools, cwd: params.cwd, agentScope: scope });
+				specs.push({ task: params.task, agent: params.agent, label: params.label, model: params.model, tools: params.tools, cwd: params.cwd, complexity: params.complexity, agentScope: scope });
 			}
 
 			if (specs.length === 0) {
@@ -175,7 +178,9 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						// max watches reached, etc.; fall back to the default note
 					}
 				}
-				const text = [`Spawned ${ids.length} background sub-agent task(s): ${ids.join(", ")}.`, watchNote].join("\n");
+				const ests = records.map((r) => r.estimatedMs).filter((x): x is number => typeof x === "number");
+				const estNote = ests.length > 0 ? `Estimated ~${formatDuration(Math.max(...ests))} for the slowest (from the complexity model). ` : "";
+				const text = [`Spawned ${ids.length} background sub-agent task(s): ${ids.join(", ")}.`, `${estNote}${watchNote}`].join("\n");
 				return { content: [{ type: "text", text }], details: { taskIds: ids, mode: "async" } };
 			}
 
@@ -257,11 +262,23 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 		parameters: Type.Object({
 			ids: Type.Optional(Type.Array(Type.String(), { description: "Task ids to await." })),
 			group: Type.Optional(Type.String({ description: "Job/group id to await." })),
-			timeoutMs: Type.Optional(Type.Number({ description: "Give up waiting after this many ms." })),
+			timeoutMs: Type.Optional(Type.Number({ description: "Hard cap: give up waiting after this many ms." })),
+			expectedMs: Type.Optional(Type.Number({ description: "Expected time to completion; if not done by then, return with status so you can re-check/re-chunk instead of blocking forever." })),
+			complexity: Type.Optional(Type.Number({ description: "Estimate expectedMs from this complexity (0-10) using the learned model, if expectedMs not given." })),
 		}),
 		async execute(_id, params, signal) {
-			const timing = withTimeout(signal, params.timeoutMs);
+			const expectedMs =
+				params.expectedMs ?? (params.complexity !== undefined ? Math.round(rt.complexity.estimateMs(params.complexity)) : undefined);
+			const effectiveTimeout = params.timeoutMs ?? expectedMs;
+			const timing = withTimeout(signal, effectiveTimeout);
 			const cap = rt.config.perTaskOutputCap;
+			const overBy = params.timeoutMs
+				? `after ${formatDuration(params.timeoutMs)}`
+				: expectedMs
+					? `within the expected ~${formatDuration(expectedMs)}`
+					: "yet";
+			const stillHint =
+				"Still running. Options: swarm_await again to keep waiting, swarm_watch to be re-activated when it finishes, or swarm_rechunk a task that is far over its estimate.";
 			try {
 				// Case 1: await a specific job (workflow / orchestration).
 				if (params.group) {
@@ -270,7 +287,7 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 					await rt.groups.waitFor([group.id], timing.signal);
 					group = rt.groups.get(params.group) ?? group;
 					const header = timing.timedOut()
-						? `Timed out after ${params.timeoutMs}ms. Job ${group.id} status: ${group.status}.`
+						? `Not complete ${overBy}. Job ${group.id} status: ${group.status}. ${stillHint}`
 						: `Job ${group.id} [${group.status}].`;
 					const err = group.errorMessage ? `\n${group.errorMessage}` : "";
 					return {
@@ -286,7 +303,7 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 					const stillRunning = tasks.filter((t) => t.status === "queued" || t.status === "running").length;
 					const blocks = tasks.map((t) => taskOutputBlock(t, cap)).join("\n\n---\n\n");
 					const header = timing.timedOut()
-						? `Timed out after ${params.timeoutMs}ms. ${stillRunning} still running.`
+						? `Not complete ${overBy}. ${stillRunning} still running. ${stillHint}`
 						: `${tasks.filter((t) => t.status === "succeeded").length}/${tasks.length} succeeded.`;
 					return { content: [{ type: "text", text: `${header}\n\n${blocks}` }], details: { taskIds: params.ids } };
 				}
@@ -309,7 +326,7 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 				const parts: string[] = [];
 				if (timing.timedOut()) {
 					const running = tasks.filter((t) => t.status === "queued" || t.status === "running").length + groups.filter((g) => g.status === "running").length;
-					parts.push(`Timed out after ${params.timeoutMs}ms. ${running} item(s) still running.`);
+					parts.push(`Not complete ${overBy}. ${running} item(s) still running. ${stillHint}`);
 				}
 				for (const g of groups) {
 					const err = g.errorMessage ? ` - ${g.errorMessage}` : "";
@@ -417,15 +434,21 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			group: Type.Optional(Type.String({ description: "Wake when this job (workflow/orchestration) finishes." })),
 			all: Type.Optional(Type.Boolean({ description: "Wake when ALL active swarm work finishes." })),
 			checkInMs: Type.Optional(Type.Number({ description: "Also wake after this many ms (a timed check-back), even if work is unfinished. Clamped to 1s..1h." })),
+			complexity: Type.Optional(Type.Number({ description: "If checkInMs is omitted, size the timed check-back from this complexity (0-10) using the learned model." })),
 			mode: Type.Optional(StringEnum(["wake", "steer"] as const, { description: "wake = resume when idle (default); steer = interrupt the current turn." })),
 			note: Type.Optional(Type.String({ description: "A short note to yourself about why you are waiting (echoed back on wake)." })),
 		}),
 		async execute(_id, params) {
+			const rawCheckInMs =
+				params.checkInMs ?? (params.complexity !== undefined ? Math.round(rt.complexity.estimateMs(params.complexity)) : undefined);
+			// Clamp here to match WatchManager's timer bounds so the reported time and
+			// the actual check-back agree.
+			const checkInMs = rawCheckInMs !== undefined ? Math.max(MIN_CHECK_MS, Math.min(MAX_CHECK_MS, rawCheckInMs)) : undefined;
 			const watchId = rt.watch.add({
 				ids: params.ids,
 				group: params.group,
 				all: params.all,
-				checkInMs: params.checkInMs,
+				checkInMs,
 				mode: params.mode,
 				note: params.note,
 			});
@@ -445,7 +468,7 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			if (params.group) parts.push(`job ${params.group}`);
 			if (params.all) parts.push("all active work");
 			const cond = parts.join(" / ") || "the requested condition";
-			const timer = params.checkInMs ? ` (or after ${params.checkInMs}ms)` : "";
+			const timer = checkInMs ? ` (or after ~${formatDuration(checkInMs)})` : "";
 			return {
 				content: [
 					{
@@ -458,8 +481,144 @@ export function registerTools(pi: ExtensionAPI, rt: SwarmRuntime): void {
 		},
 	});
 
+	// --- swarm_rechunk -------------------------------------------------------
+	pi.registerTool({
+		name: "swarm_rechunk",
+		label: "Swarm Rechunk",
+		description: [
+			"Stop a single sub-agent task that has grown too complex / is running too long and split its REMAINING work across a fresh orchestration (planner then parallel workers), seeded with its partial progress.",
+			"Returns a new job id. This is the escalation path when one agent's context can no longer handle the task.",
+		].join(" "),
+		promptSnippet: "Stop an overrunning task and re-chunk its remaining work across a swarm",
+		promptGuidelines: [
+			"Use swarm_rechunk when a single task has run well past its estimate and is not near finishing: it stops that task and decomposes what remains into parallel sub-agents.",
+		],
+		parameters: Type.Object({
+			id: Type.String({ description: "The task id (t#) to stop and re-chunk." }),
+			maxChunks: Type.Optional(Type.Number({ description: "Max chunks for the re-chunk orchestration." })),
+			criteria: Type.Optional(Type.String({ description: "Success criteria for validating the re-chunked work." })),
+			keepRunning: Type.Optional(Type.Boolean({ description: "Do not cancel the original task (default false = stop it)." })),
+		}),
+		async execute(_id, params) {
+			const task = rt.runner.get(params.id);
+			if (!task) throw new Error(`Unknown task id: ${params.id}`);
+			const group = rechunkTask(rt.coordinatorDeps(), task, {
+				maxChunks: params.maxChunks,
+				criteria: params.criteria,
+				cancel: params.keepRunning !== true,
+			});
+			return {
+				content: [
+					{
+						type: "text",
+						text: `${params.keepRunning ? "Kept" : "Stopped"} task ${task.id} and re-chunked its remaining work into job ${group.id}. Track with swarm_status group="${group.id}".`,
+					},
+				],
+				details: { groupIds: [group.id] },
+			};
+		},
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { groupIds?: string[] } | undefined;
+			const groups = (details?.groupIds ?? []).map((id) => rt.groups.get(id)).filter((g): g is GroupRecord => Boolean(g));
+			const taskIds = groups.flatMap((g) => g.taskIds);
+			const tasks = taskIds.map((id) => rt.runner.get(id)).filter((t): t is TaskRecord => Boolean(t));
+			return renderDashboard(tasks, groups, theme, expanded);
+		},
+	});
+
+	registerScheduleTool(pi, rt);
 	registerWorkflowTool(pi, rt);
 	registerOrchestrateTool(pi, rt);
+}
+
+const ScheduleActionType = StringEnum(["spawn", "orchestrate", "prompt"] as const, {
+	description: "What the schedule runs: spawn (one sub-agent), orchestrate (auto-chunk a goal), or prompt (wake yourself with a message).",
+});
+
+function registerScheduleTool(pi: ExtensionAPI, rt: SwarmRuntime): void {
+	pi.registerTool({
+		name: "swarm_schedule",
+		label: "Swarm Schedule",
+		description: [
+			"Create and manage recurring scheduled swarm tasks (cron-like; fires while pi is running).",
+			"Actions: create, list, remove, enable, disable, run.",
+			"Only available when the user has enabled model scheduling.",
+		].join(" "),
+		promptSnippet: "Create/manage recurring scheduled swarm tasks (when enabled)",
+		promptGuidelines: [
+			"Use swarm_schedule only for genuinely recurring work the user wants repeated on an interval; it fires only while pi is running.",
+		],
+		parameters: Type.Object({
+			action: StringEnum(["create", "list", "remove", "enable", "disable", "run"] as const, { description: "The management action." }),
+			name: Type.Optional(Type.String({ description: "create: a short name for the schedule." })),
+			everyMs: Type.Optional(Type.Number({ description: "create: interval in milliseconds (min 10000)." })),
+			runType: Type.Optional(ScheduleActionType),
+			task: Type.Optional(Type.String({ description: "create+spawn: the sub-agent instruction." })),
+			agent: Type.Optional(Type.String({ description: "create+spawn: agent profile name." })),
+			goal: Type.Optional(Type.String({ description: "create+orchestrate: the goal to decompose." })),
+			criteria: Type.Optional(Type.String({ description: "create+orchestrate: success criteria." })),
+			text: Type.Optional(Type.String({ description: "create+prompt: message to wake yourself with each interval." })),
+			complexity: Type.Optional(Type.Number({ description: "create: complexity 0-10 for the spawned/orchestrated work." })),
+			catchUp: Type.Optional(Type.Boolean({ description: "create: run once soon after startup if it was due while pi was off." })),
+			id: Type.Optional(Type.String({ description: "remove/enable/disable/run: the schedule id (s#)." })),
+		}),
+		async execute(_id, params) {
+			if (!rt.config.allowModelScheduling) {
+				throw new Error(
+					"Model scheduling is disabled. Ask the user to enable it in /swarm-config (allowModelScheduling), or they can manage schedules with /swarm-cron.",
+				);
+			}
+
+			if (params.action === "list") {
+				return { content: [{ type: "text", text: formatSchedules(rt) }], details: {} };
+			}
+
+			if (params.action === "create") {
+				if (!params.name || !params.everyMs || !params.runType) {
+					throw new Error("create requires name, everyMs, and runType.");
+				}
+				let action: ScheduleAction;
+				if (params.runType === "spawn") {
+					if (!params.task) throw new Error("runType 'spawn' requires `task`.");
+					action = { type: "spawn", task: params.task, agent: params.agent, complexity: params.complexity };
+				} else if (params.runType === "orchestrate") {
+					if (!params.goal) throw new Error("runType 'orchestrate' requires `goal`.");
+					action = { type: "orchestrate", goal: params.goal, criteria: params.criteria, complexity: params.complexity };
+				} else {
+					if (!params.text) throw new Error("runType 'prompt' requires `text`.");
+					action = { type: "prompt", text: params.text };
+				}
+				const rec = rt.scheduler.add({ name: params.name, everyMs: params.everyMs, action, createdBy: "model", catchUp: params.catchUp });
+				return {
+					content: [{ type: "text", text: `Created schedule ${rec.id} "${rec.name}" every ${formatInterval(rec.everyMs)} (${rec.action.type}).` }],
+					details: {},
+				};
+			}
+
+			if (!params.id) throw new Error(`Action "${params.action}" requires an \`id\`.`);
+			if (params.action === "remove") {
+				return { content: [{ type: "text", text: rt.scheduler.remove(params.id) ? `Removed ${params.id}.` : `Unknown schedule ${params.id}.` }], details: {} };
+			}
+			if (params.action === "enable" || params.action === "disable") {
+				const ok = rt.scheduler.setEnabled(params.id, params.action === "enable");
+				return { content: [{ type: "text", text: ok ? `${params.action}d ${params.id}.` : `Unknown schedule ${params.id}.` }], details: {} };
+			}
+			// run
+			return { content: [{ type: "text", text: rt.scheduler.runNow(params.id) ? `Ran ${params.id} now.` : `Unknown schedule ${params.id}.` }], details: {} };
+		},
+	});
+}
+
+export function formatSchedules(rt: SwarmRuntime): string {
+	const schedules = rt.scheduler.list();
+	if (schedules.length === 0) return "No schedules.";
+	return schedules
+		.map((s) => {
+			const state = s.enabled ? "on" : "off";
+			const last = s.lastRunAt ? `, ${s.runCount} run(s)` : "";
+			return `${s.id} [${state}] "${s.name}" every ${formatInterval(s.everyMs)} -> ${s.action.type} (${s.createdBy})${last}`;
+		})
+		.join("\n");
 }
 
 function renderDashboardFallback(text: { type: string; text?: string } | undefined): Text {
@@ -567,6 +726,7 @@ function registerOrchestrateTool(pi: ExtensionAPI, rt: SwarmRuntime): void {
 			model: Type.Optional(Type.String({ description: "Model override for all sub-agents." })),
 			tools: Type.Optional(Type.Array(Type.String(), { description: "Tool allowlist for worker sub-agents." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory for sub-agents." })),
+			complexity: Type.Optional(Type.Number({ description: "Overall difficulty 0-10 (recorded on the job; the planner also scores each chunk)." })),
 			wait: Type.Optional(Type.Boolean({ description: "Block until the job finishes (default false)." })),
 			notify: Type.Optional(Type.Boolean({ description: "When async, auto-register a watch so you are re-activated when the job finishes." })),
 		}),
@@ -586,6 +746,7 @@ function registerOrchestrateTool(pi: ExtensionAPI, rt: SwarmRuntime): void {
 				model: params.model,
 				tools: params.tools,
 				cwd: params.cwd,
+				complexity: params.complexity,
 			});
 			if (!params.wait) {
 				let note = `Poll with swarm_status group="${group.id}", block with swarm_await group="${group.id}", or swarm_watch group="${group.id}" to be re-activated when it finishes.`;

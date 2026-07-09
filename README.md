@@ -27,8 +27,10 @@ pi loads TypeScript directly.
 | `swarm_watch` | **Non-blocking**: be re-activated when watched work finishes (or after a timer) instead of blocking. |
 | `swarm_result` | Fetch the full output of one finished task (`t#`) or job (`g#`). |
 | `swarm_cancel` | Stop running/queued tasks by ids, job, or `all: true`. |
+| `swarm_rechunk` | Stop one overrunning task and split its remaining work across a fresh orchestration. |
 | `swarm_workflow` | Run a declarative multi-stage workflow (`task` / `map` / `reduce`). |
 | `swarm_orchestrate` | Auto-decompose a big goal into chunks, delegate in parallel, validate, and synthesize. |
+| `swarm_schedule` | Create/manage recurring scheduled tasks (only when `allowModelScheduling` is on). |
 
 ### Async by design
 
@@ -118,7 +120,9 @@ swarm_orchestrate {
 | Command | Purpose |
 |---------|---------|
 | `/swarm` | Live dashboard of tasks and jobs. |
-| `/swarm-config` | Interactive menu to pick which model each agent type uses. |
+| `/swarm-config` | Interactive menu: model per agent + general settings (escalation, scheduling, ...). |
+| `/swarm-cron [list\|add\|remove\|enable\|disable\|run]` | Manage recurring scheduled tasks. |
+| `/swarm-stats` | Show the learned complexity→duration model and schedules. |
 | `/swarm-cancel <taskId\|jobId\|all>` | Cancel work. |
 | `/swarm-agents` | List available agent profiles and their effective models. |
 | `/swarm-clear` | Drop finished tasks/jobs from the registry. |
@@ -170,7 +174,60 @@ for trusted projects, `<project>/.pi/swarm.json`:
 | `notifyOnComplete` | `false` | Inject a follow-up note when all background work finishes. |
 | `confirmProjectAgents` | `true` | Confirm before running repo-controlled agents. |
 | `countSubagentCost` | `true` | Fold sub-agent spend into pi's session cost counter (money only). |
+| `allowModelScheduling` | `false` | Let the model (not just you) create/manage schedules via `swarm_schedule`. |
+| `escalation` | `"notify"` | On overrun: `off`, `notify` (wake to suggest re-chunk), or `auto` (stop + re-chunk). |
+| `escalationFactor` | `2` | Escalate when elapsed exceeds this multiple of the estimated duration. |
+| `escalationMinSamples` | `3` | Min learned samples at a complexity before its estimate drives escalation. |
 | `agentDirs` | `[]` | Extra directories to search for profiles. |
+
+## Scheduled (cron-like) tasks
+
+Register recurring work that fires on an interval **while pi is running** (there is
+no background daemon, so a schedule due while pi is off only runs at the next
+startup if `catchUp` is set). Persisted globally in
+`~/.pi/agent/swarm/schedules.json`.
+
+```
+/swarm-cron add 2h orchestrate Review recent git changes and summarize risks
+/swarm-cron add 30m prompt Check the deploy queue and report anything stuck
+/swarm-cron list
+/swarm-cron disable s1     # or enable / remove / run
+```
+
+An action is one of: `spawn` (one sub-agent), `orchestrate` (auto-chunk a goal),
+or `prompt` (wake you with a message each interval). The model can manage
+schedules with the `swarm_schedule` tool **only** when you set
+`allowModelScheduling: true`.
+
+## Complexity estimates & learning
+
+Pass a `complexity` (0-10) when spawning or orchestrating; the orchestrator's
+planner also scores each chunk. On success, the actual duration is recorded
+against that complexity (globally, in `complexity.json`), building a
+complexity→duration model. That model then sizes callbacks:
+
+- `swarm_await { complexity: 6 }` waits up to the learned expected time, then
+  returns with status so you can re-check instead of blocking forever
+  (`expectedMs` sets it explicitly).
+- `swarm_watch { complexity: 6 }` sizes its timed check-back from the estimate.
+
+See the learned table with `/swarm-stats`.
+
+## Overrun escalation & re-chunking
+
+The `EscalationMonitor` watches running tasks. When a task's elapsed time exceeds
+`escalationFactor` × its estimate (once the estimate has ≥ `escalationMinSamples`
+of data), it escalates per the `escalation` setting:
+
+- `notify` (default) - wakes you/the model with a recommendation to
+  `swarm_rechunk` the task.
+- `auto` - stops the task and re-chunks its remaining work automatically.
+- `off` - nothing.
+
+`swarm_rechunk({ id })` stops the task and starts an orchestration seeded with the
+original task **and its partial output**, so the planner decomposes only what is
+left across a fresh swarm. This is the "a single agent's context can't handle
+this anymore, split it" escape hatch.
 
 ## Cost accounting
 

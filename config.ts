@@ -24,6 +24,10 @@ export const DEFAULT_CONFIG: SwarmConfig = {
 	notifyOnComplete: false,
 	confirmProjectAgents: true,
 	countSubagentCost: true,
+	allowModelScheduling: false,
+	escalation: "notify",
+	escalationFactor: 2,
+	escalationMinSamples: 3,
 	agentDirs: [],
 };
 
@@ -93,6 +97,13 @@ export function loadConfig(options: LoadConfigOptions): SwarmConfig {
 	if (!["user", "project", "both"].includes(config.defaultAgentScope)) {
 		config.defaultAgentScope = DEFAULT_CONFIG.defaultAgentScope;
 	}
+	if (!["off", "notify", "auto"].includes(config.escalation)) {
+		config.escalation = DEFAULT_CONFIG.escalation;
+	}
+	if (typeof config.escalationFactor !== "number" || !(config.escalationFactor >= 1.1)) {
+		config.escalationFactor = DEFAULT_CONFIG.escalationFactor;
+	}
+	config.escalationMinSamples = clampInt(config.escalationMinSamples, 0, 100, DEFAULT_CONFIG.escalationMinSamples);
 	// Ensure agentModels is an owned object (not shared with DEFAULT_CONFIG) so
 	// in-memory edits from /swarm-config never mutate the module default.
 	config.agentModels = isPlainObject(config.agentModels) ? { ...config.agentModels } : {};

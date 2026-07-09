@@ -16,6 +16,8 @@ import { saveUserConfig } from "./config.ts";
 import { renderDashboard, type ThemeLike } from "./render.ts";
 import type { SwarmRuntime } from "./runtime.ts";
 import { ModelSelectSubmenu } from "./settings_ui.ts";
+import type { ScheduleAction } from "./types.ts";
+import { formatDuration, formatInterval, parseDuration } from "./util.ts";
 
 export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 	// Renderer for the live dashboard (reads current registry state at render time).
@@ -114,6 +116,9 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 					widget: rt.config.widget,
 					notifyOnComplete: rt.config.notifyOnComplete,
 					countSubagentCost: rt.config.countSubagentCost,
+					escalation: rt.config.escalation,
+					escalationFactor: rt.config.escalationFactor,
+					allowModelScheduling: rt.config.allowModelScheduling,
 				});
 			};
 
@@ -165,6 +170,19 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						currentValue: cfg.countSubagentCost ? "true" : "false",
 						values: ["true", "false"],
 					},
+					{ id: "escalation", label: "Overrun escalation", currentValue: cfg.escalation, values: ["off", "notify", "auto"] },
+					{
+						id: "escalationFactor",
+						label: "Escalate at (x estimate)",
+						currentValue: String(cfg.escalationFactor),
+						values: ["1.5", "2", "3", "4"],
+					},
+					{
+						id: "allowModelScheduling",
+						label: "Let model manage schedules",
+						currentValue: cfg.allowModelScheduling ? "true" : "false",
+						values: ["true", "false"],
+					},
 				];
 
 				const onChange = (id: string, value: string) => {
@@ -185,6 +203,13 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						rt.config.notifyOnComplete = value === "true";
 					} else if (id === "countSubagentCost") {
 						rt.config.countSubagentCost = value === "true";
+					} else if (id === "escalation") {
+						if (value === "off" || value === "notify" || value === "auto") rt.config.escalation = value;
+					} else if (id === "escalationFactor") {
+						const n = Number(value);
+						if (Number.isFinite(n) && n >= 1.1) rt.config.escalationFactor = n;
+					} else if (id === "allowModelScheduling") {
+						rt.config.allowModelScheduling = value === "true";
 					} else {
 						return;
 					}
@@ -217,6 +242,73 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 					},
 				};
 			});
+		},
+	});
+
+	pi.registerCommand("swarm-cron", {
+		description: "Manage recurring scheduled swarm tasks: /swarm-cron [list|add|remove|enable|disable|run] ...",
+		getArgumentCompletions: (prefix: string) => {
+			const first = prefix.split(/\s+/)[0] ?? "";
+			if (!prefix.includes(" ")) {
+				const verbs = ["list", "add", "remove", "enable", "disable", "run"].map((v) => ({ value: v, label: v }));
+				const filtered = verbs.filter((v) => v.value.startsWith(first));
+				return filtered.length > 0 ? filtered : null;
+			}
+			const verb = first.toLowerCase();
+			if (["remove", "enable", "disable", "run"].includes(verb)) {
+				const ids = rt.scheduler.list().map((s) => ({ value: `${verb} ${s.id}`, label: `${s.id} (${s.name})` }));
+				return ids.length > 0 ? ids : null;
+			}
+			return null;
+		},
+		handler: async (args, ctx) => {
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			const verb = (parts[0] || "list").toLowerCase();
+
+			if (verb === "list" || verb === "") {
+				pi.sendMessage({ customType: "swarm-note", content: cronMarkdown(rt), display: true });
+				return;
+			}
+			if (verb === "add") {
+				const interval = parts[1];
+				const type = (parts[2] || "").toLowerCase();
+				const rest = parts.slice(3).join(" ").trim();
+				const everyMs = interval ? parseDuration(interval) : undefined;
+				if (!everyMs) {
+					ctx.ui.notify('Usage: /swarm-cron add <interval e.g. 30m|2h|1d> <spawn|orchestrate|prompt> <text...>', "warning");
+					return;
+				}
+				if (!["spawn", "orchestrate", "prompt"].includes(type) || !rest) {
+					ctx.ui.notify("Usage: /swarm-cron add <interval> <spawn|orchestrate|prompt> <text...>", "warning");
+					return;
+				}
+				let action: ScheduleAction;
+				if (type === "spawn") action = { type: "spawn", task: rest, agent: "worker" };
+				else if (type === "orchestrate") action = { type: "orchestrate", goal: rest };
+				else action = { type: "prompt", text: rest };
+				const name = rest.length > 40 ? `${rest.slice(0, 40)}...` : rest;
+				const rec = rt.scheduler.add({ name, everyMs, action, createdBy: "user" });
+				ctx.ui.notify(`Created ${rec.id} "${name}" every ${formatInterval(everyMs)} (${type}).`, "info");
+				return;
+			}
+
+			const id = parts[1];
+			if (!id) {
+				ctx.ui.notify(`/swarm-cron ${verb} needs a schedule id.`, "warning");
+				return;
+			}
+			if (verb === "remove") ctx.ui.notify(rt.scheduler.remove(id) ? `Removed ${id}.` : `Unknown ${id}.`, "info");
+			else if (verb === "enable") ctx.ui.notify(rt.scheduler.setEnabled(id, true) ? `Enabled ${id}.` : `Unknown ${id}.`, "info");
+			else if (verb === "disable") ctx.ui.notify(rt.scheduler.setEnabled(id, false) ? `Disabled ${id}.` : `Unknown ${id}.`, "info");
+			else if (verb === "run") ctx.ui.notify(rt.scheduler.runNow(id) ? `Ran ${id} now.` : `Unknown ${id}.`, "info");
+			else ctx.ui.notify(`Unknown /swarm-cron verb "${verb}".`, "warning");
+		},
+	});
+
+	pi.registerCommand("swarm-stats", {
+		description: "Show the learned complexity -> duration model and schedules",
+		handler: async (_args, _ctx) => {
+			pi.sendMessage({ customType: "swarm-note", content: statsMarkdown(rt), display: true });
 		},
 	});
 
@@ -269,4 +361,46 @@ function getEnabledModelIds(): string[] {
 		// ignore
 	}
 	return [];
+}
+
+function cronMarkdown(rt: SwarmRuntime): string {
+	const schedules = rt.scheduler.list();
+	const lines = ["# Swarm schedules", "", "_Manage with `/swarm-cron [add|remove|enable|disable|run]`._", ""];
+	if (schedules.length === 0) {
+		lines.push("No schedules yet. Example: `/swarm-cron add 2h orchestrate Review recent git changes and summarize risks`.");
+	} else {
+		for (const s of schedules) {
+			const state = s.enabled ? "on" : "off";
+			const detail = s.action.type === "prompt" ? s.action.text : s.action.type === "orchestrate" ? s.action.goal : s.action.task;
+			lines.push(`- **${s.id}** [${state}] every ${formatInterval(s.everyMs)} - ${s.action.type} _(${s.createdBy})_`);
+			lines.push(`  - ${String(detail).slice(0, 100)}`);
+			if (s.lastRunAt) lines.push(`  - ${s.runCount} run(s) so far`);
+		}
+	}
+	lines.push("", "_Schedules fire only while pi is running (no background daemon)._");
+	return lines.join("\n");
+}
+
+function statsMarkdown(rt: SwarmRuntime): string {
+	const rows = rt.complexity.table();
+	const lines = [
+		"# Swarm complexity model",
+		"",
+		"How long tasks of each estimated complexity actually take (used to size callbacks and overrun escalation):",
+		"",
+	];
+	if (rows.length === 0) {
+		lines.push("No data yet. Pass a `complexity` (0-10) when spawning/orchestrating and durations get learned here.");
+	} else {
+		lines.push("| complexity | samples | mean | min | max | last |");
+		lines.push("|---:|---:|---:|---:|---:|---:|");
+		for (const r of rows) {
+			lines.push(
+				`| ${r.complexity} | ${r.count} | ${formatDuration(Math.round(r.meanMs))} | ${formatDuration(Math.round(r.minMs))} | ${formatDuration(Math.round(r.maxMs))} | ${formatDuration(Math.round(r.lastMs))} |`,
+			);
+		}
+	}
+	const schedules = rt.scheduler.list();
+	lines.push("", `**Schedules:** ${schedules.length} (${schedules.filter((s) => s.enabled).length} enabled). See \`/swarm-cron\`.`);
+	return lines.join("\n");
 }

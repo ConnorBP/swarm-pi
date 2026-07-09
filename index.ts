@@ -6,10 +6,12 @@
  * into validated, parallel, asynchronously-executed chunks.
  *
  * Tools:   swarm_spawn, swarm_status, swarm_await, swarm_result, swarm_cancel,
- *          swarm_watch, swarm_workflow, swarm_orchestrate
- * Commands: /swarm, /swarm-config, /swarm-cancel, /swarm-agents, /swarm-clear
+ *          swarm_watch, swarm_rechunk, swarm_workflow, swarm_orchestrate, swarm_schedule
+ * Commands: /swarm, /swarm-config, /swarm-cron, /swarm-stats, /swarm-cancel,
+ *           /swarm-agents, /swarm-clear
  *
- * See README.md for usage.
+ * Also: complexity-based duration learning, expected-time re-checks, recurring
+ * schedules, and overrun-driven re-chunking. See README.md for usage.
  */
 
 import { fileURLToPath } from "node:url";
@@ -17,14 +19,18 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type AgentDiscovery, type AgentProfile, type AgentScope, discoverAgents } from "./agents.ts";
 import { registerCommands } from "./commands.ts";
+import { ComplexityModel } from "./complexity.ts";
 import { DEFAULT_CONFIG, loadConfig } from "./config.ts";
+import { EscalationMonitor } from "./escalation.ts";
 import { GroupRegistry } from "./groups.ts";
+import { rechunkTask, startOrchestration } from "./orchestrate.ts";
 import { renderTaskResult, widgetLines, type ThemeLike } from "./render.ts";
 import { SwarmRunner } from "./runner.ts";
 import type { SwarmRuntime } from "./runtime.ts";
+import { Scheduler } from "./schedule.ts";
 import { SwarmStore } from "./store.ts";
 import { registerTools } from "./tools.ts";
-import type { SwarmConfig, TaskRecord } from "./types.ts";
+import type { ScheduleAction, ScheduleRecord, SwarmConfig, TaskRecord } from "./types.ts";
 import { WatchManager, type WakeMode } from "./watch.ts";
 import type { CoordinatorDeps } from "./workflow.ts";
 
@@ -48,6 +54,9 @@ export default function swarm_extension(pi: ExtensionAPI) {
 	// counters are left untouched so context accounting stays accurate).
 	let pendingSubagentCost = 0;
 	let watchManager: WatchManager | undefined;
+	let escalationMonitor: EscalationMonitor | undefined;
+	// Global (cross-session) learning of complexity -> actual duration.
+	const complexityModel = new ComplexityModel();
 
 	const getDiscovery = (scope: AgentScope): AgentDiscovery => {
 		let cached = discoveryCache.get(scope);
@@ -104,6 +113,10 @@ export default function swarm_extension(pi: ExtensionAPI) {
 		if (config.countSubagentCost && record.usage.cost > 0) {
 			pendingSubagentCost += record.usage.cost;
 		}
+		// Learn how long this complexity actually took (successful runs only).
+		if (record.status === "succeeded" && record.complexity !== undefined && record.startedAt && record.endedAt) {
+			complexityModel.record(record.complexity, record.endedAt - record.startedAt);
+		}
 		if (!config.notifyOnComplete) return;
 		if (runner.activeCount() > 0 || groups.activeCount() > 0) return;
 		try {
@@ -118,6 +131,68 @@ export default function swarm_extension(pi: ExtensionAPI) {
 
 	const coordinatorDeps = (): CoordinatorDeps => ({ runner, groups, config, cwd });
 
+	// Executes a fired schedule against the current session's runtime.
+	const scheduleExecute = (action: ScheduleAction, record: ScheduleRecord) => {
+		try {
+			if (action.type === "spawn") {
+				runner.enqueue({
+					task: action.task,
+					agent: action.agent,
+					model: action.model,
+					tools: action.tools,
+					cwd: action.cwd ?? cwd,
+					complexity: action.complexity,
+					label: `cron:${record.name}`,
+				});
+			} else if (action.type === "orchestrate") {
+				startOrchestration(coordinatorDeps(), {
+					goal: action.goal,
+					criteria: action.criteria,
+					maxChunks: action.maxChunks,
+					complexity: action.complexity,
+					cwd: action.cwd ?? cwd,
+				});
+			} else if (action.type === "prompt") {
+				pi.sendMessage(
+					{ customType: "swarm-wake", content: `[swarm schedule "${record.name}"] ${action.text}`, display: true },
+					{ deliverAs: action.mode === "steer" ? "steer" : "followUp", triggerTurn: true },
+				);
+			}
+		} catch (err) {
+			console.error("swarm: schedule execute failed:", (err as Error).message);
+		}
+	};
+
+	// Global scheduler (records persist across sessions; timers are session-scoped).
+	const scheduler = new Scheduler({ execute: scheduleExecute, onChange: refreshUI, now: () => Date.now() });
+
+	// When a task overruns its complexity estimate: notify the model, or (auto) stop
+	// it and re-chunk the remaining work across a fresh swarm.
+	const onEscalate = (task: TaskRecord) => {
+		const liveEst = task.complexity !== undefined ? complexityModel.estimateMs(task.complexity) : task.estimatedMs;
+		const estS = liveEst ? Math.round(liveEst / 1000) : undefined;
+		const elapsedS = task.startedAt ? Math.round((Date.now() - task.startedAt) / 1000) : undefined;
+		const over = `~${estS ?? "?"}s estimated, ${elapsedS ?? "?"}s elapsed`;
+		if (config.escalation === "auto") {
+			try {
+				const group = rechunkTask(coordinatorDeps(), task, {});
+				wake(
+					`[swarm] Task ${task.id} ("${task.label}") overran its estimate (${over}, >${config.escalationFactor}x). It was stopped and its remaining work re-chunked into job ${group.id}. Track it with swarm_status group="${group.id}".`,
+					"wake",
+					{ taskId: task.id, groupId: group.id },
+				);
+			} catch (err) {
+				console.error("swarm: auto re-chunk failed:", (err as Error).message);
+			}
+		} else {
+			wake(
+				`[swarm] Task ${task.id} ("${task.label}") is running long (${over}, over ${config.escalationFactor}x its estimate). It may be too complex for one agent. Options: swarm_rechunk({ id: "${task.id}" }) to stop it and split the remaining work across a fresh swarm; swarm_result to inspect progress; or leave it running.`,
+				"wake",
+				{ taskId: task.id },
+			);
+		}
+	};
+
 	const rt: SwarmRuntime = {
 		get runner() {
 			return runner;
@@ -131,6 +206,12 @@ export default function swarm_extension(pi: ExtensionAPI) {
 		get watch() {
 			if (!watchManager) throw new Error("swarm watch manager not initialized");
 			return watchManager;
+		},
+		get complexity() {
+			return complexityModel;
+		},
+		get scheduler() {
+			return scheduler;
 		},
 		get config() {
 			return config;
@@ -161,11 +242,28 @@ export default function swarm_extension(pi: ExtensionAPI) {
 		}
 		discoveryCache.clear();
 		watchManager?.clearAll();
+		escalationMonitor?.stop();
 		const sessionKey = deriveSessionKey(ctx);
 		store = new SwarmStore(sessionKey);
 		groups = new GroupRegistry(store, handleChange);
-		runner = new SwarmRunner({ config, store, cwd, resolveProfile, onChange: handleChange, onTaskComplete });
+		runner = new SwarmRunner({
+			config,
+			store,
+			cwd,
+			resolveProfile,
+			onChange: handleChange,
+			onTaskComplete,
+			estimateMs: (c) => complexityModel.estimateMs(c),
+		});
 		watchManager = new WatchManager({ runner, groups, wake, maxWatches: 8 });
+		escalationMonitor = new EscalationMonitor({
+			runner,
+			config,
+			isConfident: (c, m) => complexityModel.isConfident(c, m),
+			estimateMs: (c) => complexityModel.estimateMs(c),
+			onEscalate,
+			now: () => Date.now(),
+		});
 		// Recover prior task/job snapshots for this session (read-only history).
 		try {
 			runner.adopt(store.loadTasks());
@@ -208,6 +306,8 @@ export default function swarm_extension(pi: ExtensionAPI) {
 		try {
 			rebuild(ctx);
 			refreshUI();
+			escalationMonitor?.start();
+			scheduler.start();
 		} catch (err) {
 			console.error("swarm: session_start failed:", (err as Error).message);
 		}
@@ -220,6 +320,8 @@ export default function swarm_extension(pi: ExtensionAPI) {
 				widgetTimer = undefined;
 			}
 			watchManager?.clearAll();
+			escalationMonitor?.stop();
+			scheduler.stop();
 			runner?.shutdown();
 			uiApi?.setWidget("swarm", undefined);
 		} catch {
