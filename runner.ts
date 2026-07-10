@@ -46,7 +46,7 @@ export interface RunnerDeps {
 /** Resolve how to re-invoke the running `pi` binary for a child process. */
 export function piInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/") || currentScript?.includes("~BUN");
 	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
 		return { command: process.execPath, args: [currentScript, ...args] };
 	}
