@@ -119,6 +119,9 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 					escalation: rt.config.escalation,
 					escalationFactor: rt.config.escalationFactor,
 					allowModelScheduling: rt.config.allowModelScheduling,
+					logEvents: rt.config.logEvents,
+					retentionDays: rt.config.retentionDays,
+					maxSessions: rt.config.maxSessions,
 				});
 			};
 
@@ -183,6 +186,24 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						currentValue: cfg.allowModelScheduling ? "true" : "false",
 						values: ["true", "false"],
 					},
+					{
+						id: "logEvents",
+						label: "Raw event log (debug, multi-GB)",
+						currentValue: cfg.logEvents ? "true" : "false",
+						values: ["true", "false"],
+					},
+					{
+						id: "retentionDays",
+						label: "Session retention (days, 0=all)",
+						currentValue: String(cfg.retentionDays),
+						values: ["0", "1", "3", "7", "14", "30"],
+					},
+					{
+						id: "maxSessions",
+						label: "Max sessions kept (0=all)",
+						currentValue: String(cfg.maxSessions),
+						values: ["0", "3", "5", "10", "20"],
+					},
 				];
 
 				const onChange = (id: string, value: string) => {
@@ -210,6 +231,14 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						if (Number.isFinite(n) && n >= 1.1) rt.config.escalationFactor = n;
 					} else if (id === "allowModelScheduling") {
 						rt.config.allowModelScheduling = value === "true";
+					} else if (id === "logEvents") {
+						rt.config.logEvents = value === "true";
+					} else if (id === "retentionDays") {
+						const n = Number.parseInt(value, 10);
+						if (Number.isFinite(n)) rt.config.retentionDays = Math.max(0, Math.min(365, n));
+					} else if (id === "maxSessions") {
+						const n = Number.parseInt(value, 10);
+						if (Number.isFinite(n)) rt.config.maxSessions = Math.max(0, Math.min(100, n));
 					} else {
 						return;
 					}

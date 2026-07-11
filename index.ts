@@ -245,6 +245,16 @@ export default function swarm_extension(pi: ExtensionAPI) {
 		escalationMonitor?.stop();
 		const sessionKey = deriveSessionKey(ctx);
 		store = new SwarmStore(sessionKey);
+		if (ctx) {
+			try {
+				store.purgeOldSessions({
+					retentionDays: config.retentionDays,
+					maxSessions: config.maxSessions,
+				});
+			} catch {
+				// best effort: never block session rebuild on cleanup
+			}
+		}
 		groups = new GroupRegistry(store, handleChange);
 		runner = new SwarmRunner({
 			config,

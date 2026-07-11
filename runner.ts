@@ -336,7 +336,7 @@ export class SwarmRunner {
 
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
-			this.deps.store.appendTaskEvent(id, line);
+			if (this.deps.config.logEvents) this.deps.store.appendTaskEvent(id, line);
 			let event: { type?: string; message?: Message };
 			try {
 				event = JSON.parse(line);

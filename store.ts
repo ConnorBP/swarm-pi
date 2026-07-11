@@ -112,6 +112,54 @@ export class SwarmStore {
 		return removed;
 	}
 
+	/** Delete old session dirs under the swarm root (best effort). Always skips
+	 * the current session. Removes dirs older than retentionDays, then keeps only
+	 * the newest maxSessions. Either limit set to 0 disables that rule. Returns the
+	 * count of session dirs removed. */
+	purgeOldSessions(opts: { retentionDays: number; maxSessions: number }): number {
+		const root = path.dirname(this.baseDir);
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(root, { withFileTypes: true });
+		} catch {
+			return 0;
+		}
+		const current = path.basename(this.baseDir);
+		const dirs: Array<{ name: string; mtime: number }> = [];
+		for (const e of entries) {
+			if (!e.isDirectory() || e.name === current) continue;
+			try {
+				dirs.push({ name: e.name, mtime: fs.statSync(path.join(root, e.name)).mtimeMs });
+			} catch {
+				// skip unreadable
+			}
+		}
+		let removed = 0;
+		if (opts.retentionDays > 0) {
+			const cutoff = Date.now() - opts.retentionDays * 86_400_000;
+			for (const d of dirs) {
+				if (d.mtime < cutoff) removed += this.removeDir(path.join(root, d.name));
+			}
+		}
+		if (opts.maxSessions > 0) {
+			dirs
+				.filter((d) => fs.existsSync(path.join(root, d.name)))
+				.sort((a, b) => b.mtime - a.mtime)
+				.slice(opts.maxSessions)
+				.forEach((d) => { removed += this.removeDir(path.join(root, d.name)); });
+		}
+		return removed;
+	}
+
+	private removeDir(dir: string): number {
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+			return 1;
+		} catch {
+			return 0;
+		}
+	}
+
 	private unlink(file: string): number {
 		try {
 			if (fs.existsSync(file)) {

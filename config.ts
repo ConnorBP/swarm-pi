@@ -29,6 +29,9 @@ export const DEFAULT_CONFIG: SwarmConfig = {
 	escalationFactor: 2,
 	escalationMinSamples: 3,
 	agentDirs: [],
+	logEvents: false,
+	retentionDays: 7,
+	maxSessions: 5,
 };
 
 /** Root directory for swarm state under the agent config dir. */
@@ -104,6 +107,9 @@ export function loadConfig(options: LoadConfigOptions): SwarmConfig {
 		config.escalationFactor = DEFAULT_CONFIG.escalationFactor;
 	}
 	config.escalationMinSamples = clampInt(config.escalationMinSamples, 0, 100, DEFAULT_CONFIG.escalationMinSamples);
+	config.logEvents = config.logEvents === true;
+	config.retentionDays = clampInt(config.retentionDays, 0, 365, DEFAULT_CONFIG.retentionDays);
+	config.maxSessions = clampInt(config.maxSessions, 0, 100, DEFAULT_CONFIG.maxSessions);
 	// Ensure agentModels is an owned object (not shared with DEFAULT_CONFIG) so
 	// in-memory edits from /swarm-config never mutate the module default.
 	config.agentModels = isPlainObject(config.agentModels) ? { ...config.agentModels } : {};

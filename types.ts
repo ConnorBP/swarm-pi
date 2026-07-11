@@ -193,6 +193,14 @@ export interface SwarmConfig {
 	escalationMinSamples: number;
 	/** Extra directories to search for agent profiles. */
 	agentDirs: string[];
+	/** Write the per-task raw child event stream to <taskId>.jsonl. Default off: the
+	 * stream has no in-code reader and grows unbounded (multi-GB per task). Enable
+	 * only for out-of-band debugging of a stuck sub-agent. */
+	logEvents: boolean;
+	/** Retention sweep: delete session dirs older than this many days (0 = keep all). */
+	retentionDays: number;
+	/** Retention sweep: keep only the newest N session dirs (0 = keep all). */
+	maxSessions: number;
 }
 
 /** An action a schedule fires: spawn work, orchestrate, or prompt the main agent. */
