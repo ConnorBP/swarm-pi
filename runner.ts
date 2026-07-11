@@ -27,6 +27,7 @@ interface TaskHandle {
 	messages: Message[];
 	tmpPromptPath?: string;
 	tmpPromptDir?: string;
+	tmpTaskPath?: string;   // oversized task written to a file (ENAMETOOLONG guard)
 	aborted: boolean;
 	started: boolean;
 }
@@ -301,9 +302,38 @@ export class SwarmRunner {
 				// If we cannot write the prompt file, run without it.
 			}
 		}
-		args.push(`Task: ${record.task}`);
+		if (record.task.length > SwarmRunner.MAX_INLINE_TASK) {
+			try {
+				// Reuse the profile-prompt tmpdir if one was created; otherwise make one.
+				let dir = handle.tmpPromptDir;
+				if (!dir) {
+					dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swarm-"));
+					handle.tmpPromptDir = dir;
+				}
+				const file = path.join(dir, "task.md");
+				fs.writeFileSync(file, record.task, { encoding: "utf-8", mode: 0o600 });
+				handle.tmpTaskPath = file;
+				const preview = record.task.slice(0, 800).replace(/\s+/g, " ").trim();
+				args.push(`Task: ${preview} ... (FULL TASK INSTRUCTIONS are in the file at ${file} — read it with the read tool, then execute it in full.)`);
+			} catch {
+				// If we cannot write the temp file, fall back to inline (may fail on
+				// Windows if truly oversized, but better than silently dropping).
+				args.push(`Task: ${record.task}`);
+			}
+		} else {
+			args.push(`Task: ${record.task}`);
+		}
 		return args;
 	}
+
+	// Oversized tasks (e.g. the orchestrator synthesizer prompt, which concatenates
+	// all chunk outputs) blow the OS argv limit when passed inline as a CLI arg
+	// (ENAMETOOLONG: name too long, uv_spawn — Windows CreateProcess caps at 32767
+	// chars). When the task exceeds a safe threshold, spill it to a temp file and
+	// pass a short reference instead. The sub-agent reads the file with the `read`
+	// tool. Keep the threshold well under the Windows limit to leave room for the
+	// other args + the `Task:` prefix.
+	private static readonly MAX_INLINE_TASK = 20000;
 
 	private startTask(id: string, record: TaskRecord, handle: TaskHandle): void {
 		handle.started = true;
@@ -437,6 +467,14 @@ export class SwarmRunner {
 	}
 
 	private cleanupTemp(handle: TaskHandle): void {
+		if (handle.tmpTaskPath) {
+			try {
+				fs.unlinkSync(handle.tmpTaskPath);
+			} catch {
+				// ignore
+			}
+			handle.tmpTaskPath = undefined;
+		}
 		if (handle.tmpPromptPath) {
 			try {
 				fs.unlinkSync(handle.tmpPromptPath);

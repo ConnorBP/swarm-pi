@@ -119,6 +119,9 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 					escalation: rt.config.escalation,
 					escalationFactor: rt.config.escalationFactor,
 					allowModelScheduling: rt.config.allowModelScheduling,
+					swarmPrimer: rt.config.swarmPrimer,
+					delegationMode: rt.config.delegationMode,
+					tddMode: rt.config.tddMode,
 					logEvents: rt.config.logEvents,
 					retentionDays: rt.config.retentionDays,
 					maxSessions: rt.config.maxSessions,
@@ -187,6 +190,24 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						values: ["true", "false"],
 					},
 					{
+						id: "swarmPrimer",
+						label: "Swarm primer (inject usage guide into system prompt)",
+						currentValue: cfg.swarmPrimer ? "true" : "false",
+						values: ["true", "false"],
+					},
+					{
+						id: "delegationMode",
+						label: "Delegator mode (primer: push implementation to cheaper sub-agents)",
+						currentValue: cfg.delegationMode ? "true" : "false",
+						values: ["true", "false"],
+					},
+					{
+						id: "tddMode",
+						label: "TDD mode (primer: test harness + occasional audit sub-agents)",
+						currentValue: cfg.tddMode ? "true" : "false",
+						values: ["true", "false"],
+					},
+					{
 						id: "logEvents",
 						label: "Raw event log (debug, multi-GB)",
 						currentValue: cfg.logEvents ? "true" : "false",
@@ -231,6 +252,12 @@ export function registerCommands(pi: ExtensionAPI, rt: SwarmRuntime): void {
 						if (Number.isFinite(n) && n >= 1.1) rt.config.escalationFactor = n;
 					} else if (id === "allowModelScheduling") {
 						rt.config.allowModelScheduling = value === "true";
+					} else if (id === "swarmPrimer") {
+						rt.config.swarmPrimer = value === "true";
+					} else if (id === "delegationMode") {
+						rt.config.delegationMode = value === "true";
+					} else if (id === "tddMode") {
+						rt.config.tddMode = value === "true";
 					} else if (id === "logEvents") {
 						rt.config.logEvents = value === "true";
 					} else if (id === "retentionDays") {

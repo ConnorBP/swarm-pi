@@ -24,6 +24,7 @@ import { DEFAULT_CONFIG, loadConfig } from "./config.ts";
 import { EscalationMonitor } from "./escalation.ts";
 import { GroupRegistry } from "./groups.ts";
 import { rechunkTask, startOrchestration } from "./orchestrate.ts";
+import { buildSwarmPrimer } from "./primer.ts";
 import { renderTaskResult, widgetLines, type ThemeLike } from "./render.ts";
 import { SwarmRunner } from "./runner.ts";
 import type { SwarmRuntime } from "./runtime.ts";
@@ -163,8 +164,8 @@ export default function swarm_extension(pi: ExtensionAPI) {
 		}
 	};
 
-	// Global scheduler (records persist across sessions; timers are session-scoped).
-	const scheduler = new Scheduler({ execute: scheduleExecute, onChange: refreshUI, now: () => Date.now() });
+	// Session-scoped scheduler (constructed in rebuild() with the session key).
+	let scheduler: Scheduler;
 
 	// When a task overruns its complexity estimate: notify the model, or (auto) stop
 	// it and re-chunk the remaining work across a fresh swarm.
@@ -243,8 +244,10 @@ export default function swarm_extension(pi: ExtensionAPI) {
 		discoveryCache.clear();
 		watchManager?.clearAll();
 		escalationMonitor?.stop();
+		scheduler?.stop();
 		const sessionKey = deriveSessionKey(ctx);
 		store = new SwarmStore(sessionKey);
+		scheduler = new Scheduler({ sessionKey, execute: scheduleExecute, onChange: refreshUI, now: () => Date.now() });
 		if (ctx) {
 			try {
 				store.purgeOldSessions({
@@ -287,6 +290,24 @@ export default function swarm_extension(pi: ExtensionAPI) {
 
 	registerTools(pi, rt);
 	registerCommands(pi, rt);
+
+	// Inject the swarm primer into the system prompt each turn when enabled.
+	// Returns { systemPrompt } to replace this turn's prompt (chained across
+	// extensions); returns undefined (no-op) when the primer is off or empty, or
+	// on any error so a primer failure never breaks the agent loop.
+	pi.on("before_agent_start", async (event, _ctx) => {
+		try {
+			if (!config.swarmPrimer) return;
+			const primer = buildSwarmPrimer(config);
+			if (!primer) return;
+			return {
+				systemPrompt: (event.systemPrompt ?? "") + "\n\n" + primer,
+			};
+		} catch (err) {
+			console.error("swarm: before_agent_start primer failed:", (err as Error).message);
+			return;
+		}
+	});
 
 	// Fold sub-agent spend into pi's session cost counter by augmenting the next
 	// assistant message's usage.cost.total. Only the money is adjusted; token and
@@ -331,7 +352,7 @@ export default function swarm_extension(pi: ExtensionAPI) {
 			}
 			watchManager?.clearAll();
 			escalationMonitor?.stop();
-			scheduler.stop();
+			scheduler?.stop();
 			runner?.shutdown();
 			uiApi?.setWidget("swarm", undefined);
 		} catch {

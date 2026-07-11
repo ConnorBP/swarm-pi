@@ -1,16 +1,16 @@
 /**
  * Scheduler - recurring "cron-like" swarm tasks.
  *
- * Schedules are persisted globally (~/.pi/agent/swarm/schedules.json) so they
- * survive restarts, and armed with in-process timers while pi is running. Each
- * schedule fires a ScheduleAction (spawn work, orchestrate, or prompt the main
+ * Schedules are persisted per session (~/.pi/agent/swarm/<sessionKey>/schedules.json)
+ * so they survive restarts, and armed with in-process timers while pi is running.
+ * Each schedule fires a ScheduleAction (spawn work, orchestrate, or prompt the main
  * agent) on its interval.
  *
  * Honest limitation: timers only fire while a pi process is alive. There is no
  * background daemon, so "every 6h" only fires if pi runs that long. A schedule
  * due while pi was off fires shortly after the next startup only when catchUp is
- * set. A best-effort disk guard avoids double-firing across concurrent pi
- * instances.
+ * set. An atomic O_EXCL claim file (per session) avoids double-firing across
+ * concurrent pi instances.
  */
 
 import * as fs from "node:fs";
@@ -35,13 +35,16 @@ export interface ScheduleInput {
 }
 
 export interface SchedulerDeps {
+	sessionKey: string;
 	execute: (action: ScheduleAction, record: ScheduleRecord) => void;
 	onChange?: () => void;
 	now: () => number;
 }
 
 export class Scheduler {
+	private readonly baseDir: string;
 	private readonly file: string;
+	private readonly claimsDir: string;
 	private readonly deps: SchedulerDeps;
 	private records: Map<string, ScheduleRecord> = new Map();
 	private timers: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -50,7 +53,10 @@ export class Scheduler {
 
 	constructor(deps: SchedulerDeps) {
 		this.deps = deps;
-		this.file = path.join(swarmStateRoot(), "schedules.json");
+		const safeKey = deps.sessionKey.replace(/[^\w.-]+/g, "_") || "ephemeral";
+		this.baseDir = path.join(swarmStateRoot(), safeKey);
+		this.file = path.join(this.baseDir, "schedules.json");
+		this.claimsDir = path.join(this.baseDir, "claims");
 		this.load();
 	}
 
@@ -71,9 +77,18 @@ export class Scheduler {
 		}
 	}
 
+	private ensureDirs(): void {
+		try {
+			fs.mkdirSync(this.baseDir, { recursive: true });
+			fs.mkdirSync(this.claimsDir, { recursive: true });
+		} catch {
+			// best effort
+		}
+	}
+
 	private save(): void {
 		try {
-			fs.mkdirSync(swarmStateRoot(), { recursive: true });
+			this.ensureDirs();
 			// Preserve any newer fire markers another pi instance wrote, so this
 			// whole-file write does not revert another instance's de-dup progress.
 			const disk = this.readDiskAll();
@@ -231,9 +246,50 @@ export class Scheduler {
 		if (!live) return;
 
 		if (!manual) {
-			// Cross-instance de-dup: skip if another pi instance fired this recently.
-			const disk = this.readDiskRecord(record.id);
 			const now = this.deps.now();
+
+			// Stale-claim cleanup: best-effort sweep of the claims dir. Delete any
+			// *.lock file whose mtime is older than now - everyMs, bounding claim-file
+			// growth to ~1 per interval. Never throw.
+			try {
+				this.sweepStaleClaims(now - live.everyMs);
+			} catch {
+				// best effort
+			}
+
+			// Atomic O_EXCL claim of this slot. live.nextRunAt is the scheduled
+			// instant — still set to this slot at fire time, before we recompute it.
+			// fs.openSync(..., "wx") atomically fails with EEXIST if another pi
+			// process already claimed this exact slot.
+			this.ensureDirs();
+			const claimPath = path.join(this.claimsDir, `${live.id}-${live.nextRunAt}.lock`);
+			let fd: number | undefined;
+			try {
+				fd = fs.openSync(claimPath, "wx");
+				fs.writeFileSync(fd, `${process.pid}\n${now}\n`, "utf-8");
+				fs.closeSync(fd);
+			} catch (err) {
+				if (fd !== undefined) {
+					try { fs.closeSync(fd); } catch { /* ignore */ }
+				}
+				if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+					// Another pi process is firing this slot. Sync state from disk so
+					// we don't double-fire, then re-arm without executing.
+					const disk = this.readDiskRecord(record.id);
+					if (disk?.lastRunAt !== undefined) {
+						live.lastRunAt = disk.lastRunAt;
+						live.nextRunAt = disk.lastRunAt + live.everyMs;
+					}
+					this.save();
+					if (live.enabled) this.arm(live);
+					return;
+				}
+				// Non-EEXIST errors (e.g. missing dir): fall through to the secondary
+				// guard below, which still protects against double-fires.
+			}
+
+			// Secondary guard: skip if another pi instance fired this recently.
+			const disk = this.readDiskRecord(record.id);
 			if (disk?.lastRunAt !== undefined && now - disk.lastRunAt < live.everyMs / 2) {
 				live.lastRunAt = disk.lastRunAt;
 				live.nextRunAt = disk.lastRunAt + live.everyMs;
@@ -256,6 +312,25 @@ export class Scheduler {
 
 		if (!manual && live.enabled) this.arm(live);
 		this.deps.onChange?.();
+	}
+
+	private sweepStaleClaims(beforeMs: number): void {
+		if (!fs.existsSync(this.claimsDir)) return;
+		let entries: string[];
+		try {
+			entries = fs.readdirSync(this.claimsDir);
+		} catch {
+			return;
+		}
+		for (const name of entries) {
+			if (!name.endsWith(".lock")) continue;
+			try {
+				const p = path.join(this.claimsDir, name);
+				if (fs.statSync(p).mtimeMs < beforeMs) fs.unlinkSync(p);
+			} catch {
+				// best effort
+			}
+		}
 	}
 
 	private readDiskRecord(id: string): ScheduleRecord | undefined {

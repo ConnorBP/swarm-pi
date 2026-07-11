@@ -185,6 +185,12 @@ export interface SwarmConfig {
 	countSubagentCost: boolean;
 	/** Allow the model (not just the user) to create/manage scheduled tasks. */
 	allowModelScheduling: boolean;
+	/** Inject a swarm usage primer into the system prompt each turn (lists tools, steers chunking/parallelization/watch-rechunk). Default false. */
+	swarmPrimer: boolean;
+	/** When swarmPrimer is on, append a delegator-mode paragraph: main agent keeps architecture/decisions, pushes implementation to cheaper sub-agents. Default false. */
+	delegationMode: boolean;
+	/** When swarmPrimer is on, append a TDD-mode paragraph: keep a test harness (standard/should-fail/edge/regression cases), run it as you go, and spawn occasional single-mandate audit sub-agents. Default false. */
+	tddMode: boolean;
 	/** What to do when a task overruns its estimate: off | notify | auto (re-chunk). */
 	escalation: "off" | "notify" | "auto";
 	/** Escalate when elapsed exceeds this multiple of the estimated duration. */
